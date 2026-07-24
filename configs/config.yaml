@@ -1,0 +1,33 @@
+# ECH Proxy 配置文件
+# 放在同目录下命名为 config.yaml 即可自动加载
+
+# 监听地址
+listen: "127.0.0.1:17171"
+
+# DoH 服务器地址（必须 HTTPS）
+# 国内推荐: https://0kbpekmcr1.cloudflare-gateway.com/dns-query
+doh: "https://1.1.1.1/dns-query"
+
+# 代理模式: http / socks5 / both
+mode: "http"
+
+# 日志级别: debug / info / warn / error
+log_level: "info"
+
+# TLS 配置
+tls:
+  timeout: "15s"
+  skip_verify: false
+  # ECH 失败后是否回退到普通 TLS
+  fallback_plain: true
+
+# DNS 配置
+dns:
+  cache_ttl: "300s"
+  timeout: "10s"
+  prefer_ipv4: true
+
+# 代理连接配置
+proxy:
+  connect_timeout: "10s"
+  idle_timeout: "120s"
