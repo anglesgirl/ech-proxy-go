@@ -6,10 +6,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/anglesgirl/ech-proxy-go/internal/config"
@@ -40,7 +42,7 @@ func main() {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("ECH Proxy %s", Version)
+	log.Printf("ECH Proxy %s (%s/%s)", Version, runtime.GOOS, runtime.GOARCH)
 	log.Printf("  Listen: %s", cfg.Listen)
 	log.Printf("  DoH:    %s", cfg.DoH)
 	log.Printf("  Mode:   %s", cfg.Mode)
@@ -48,12 +50,20 @@ func main() {
 	srv := proxy.New(cfg)
 
 	// 信号处理：优雅关闭
+	// Windows: 只支持 Ctrl+C (os.Interrupt)
+	// Unix:    支持 SIGINT 和 SIGTERM
 	go func() {
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		if runtime.GOOS == "windows" {
+			signal.Notify(sigCh, os.Interrupt)
+		} else {
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		}
 		sig := <-sigCh
 		log.Printf("收到信号 %v，正在关闭...", sig)
-		srv.Shutdown(nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 0)
+		defer cancel()
+		srv.Shutdown(ctx)
 		os.Exit(0)
 	}()
 

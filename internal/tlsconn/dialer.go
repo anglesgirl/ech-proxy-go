@@ -41,7 +41,7 @@ func New(timeout time.Duration, skipVerify, fallbackPlain bool) *Dialer {
 		skipVerify:    skipVerify,
 		fallbackPlain: fallbackPlain,
 	}
-	if pool := certutil.LoadAndroidCertPool(); pool != nil {
+	if pool := certutil.LoadSystemCertPool(); pool != nil {
 		d.certPool = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
 	return d

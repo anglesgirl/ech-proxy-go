@@ -30,7 +30,10 @@ dns:
   prefer_ipv4: true
   # ECH 配置文件缓存路径（可选）
   # DoH 不可用时从文件读取上次缓存的 ECHConfig，TTL 12 小时
-  # cache_path: "/data/data/com.example.app/cache/ech_config.json"
+  # Windows: "ech_config.json" (同目录) 或 "%LOCALAPPDATA%\ech-proxy\ech_config.json"
+  # Linux:   "/tmp/ech_config.json"
+  # Android: "/data/data/com.example.app/cache/ech_config.json"
+  # cache_path: "ech_config.json"
 
 # 代理连接配置
 proxy:

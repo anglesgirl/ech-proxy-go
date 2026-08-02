@@ -20,9 +20,9 @@
 - **ECH 拒绝重试** — 服务器拒绝 ECH 时自动使用 `retry_configs` 重试
 - **禁止降级模式** — `no_downgrade` 选项防止 ECH 主机回退到明文 TLS（保护 SNI）
 - **AS13335 IP 校验** — 自定义边缘 IP 只接受 Cloudflare AS13335 地址
-- **Android 证书池** — 自动加载 Android 系统 CA 证书（DER + PEM）
+- **跨平台证书** — Android 扫描系统证书目录 (DER+PEM)；Windows/Linux/macOS 使用 OS 原生证书库
 - **配置文件** — YAML 配置文件，灵活可配
-- **优雅关闭** — 支持 SIGINT/SIGTERM 信号优雅退出
+- **优雅关闭** — Unix 支持 SIGINT/SIGTERM，Windows 支持 Ctrl+C
 - **跨平台** — 纯 Go 静态编译，支持 Linux/Android/macOS/Windows
 
 ## 快速开始
@@ -57,6 +57,55 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-amd
 
 将二进制放入 Android 应用的 assets 目录，运行时提取到私有目录执行，设置 HTTP 代理指向 `127.0.0.1:17171`。
 
+### Windows 使用
+
+#### 方式一：下载预编译版本（推荐）
+
+1. 从 [GitHub Releases](../../releases) 下载 `ech-proxy-windows-x86_64.exe`
+2. 放到一个空文件夹，重命名为 `ech-proxy.exe`
+3. 同目录放置 `config.yaml`（可选，见下方配置文件说明）
+4. 双击 `start.bat` 启动，或命令行运行：
+
+```cmd
+ech-proxy.exe -config config.yaml
+```
+
+5. Ctrl+C 退出
+
+#### 方式二：自行编译
+
+```cmd
+go build -o ech-proxy.exe ./cmd/ech-proxy
+```
+
+#### 设置 Windows 系统代理
+
+以管理员身份打开 PowerShell：
+
+```powershell
+# 开启系统代理（指向 ECH Proxy）
+.\set-proxy.ps1
+
+# 关闭系统代理
+.\unset-proxy.ps1
+```
+
+或手动设置：`设置 → 网络和 Internet → 代理 → 手动设置代理`，地址填 `127.0.0.1`，端口填 `17171`。
+
+#### Windows 配置文件示例
+
+```yaml
+listen: "127.0.0.1:17171"
+doh: "https://1.1.1.1/dns-query"
+mode: "http"
+dns:
+  cache_path: "ech_config.json"   # 缓存文件放在 exe 同目录
+ech:
+  no_downgrade: false
+```
+
+> Windows 下证书验证自动使用系统证书库，无需额外配置。
+
 ### 客户端配置
 
 ```bash
@@ -85,7 +134,7 @@ tls:
 dns:
   cache_ttl: "300s"
   prefer_ipv4: true
-  cache_path: "/tmp/ech_config.json"  # ECH 配置文件缓存（可选）
+  cache_path: "ech_config.json"       # ECH 配置文件缓存（可选，放同目录）
 ech:
   custom_ips: "104.20.8.2,104.20.9.2"  # 自定义 Cloudflare 边缘 IP
   no_downgrade: false                    # 禁止降级到明文 TLS
@@ -105,14 +154,17 @@ ech:
 ech-proxy-go/
 ├── cmd/ech-proxy/          # 主入口
 ├── internal/
-│   ├── certutil/           # Android 证书池加载 (DER + PEM)
+│   ├── certutil/           # 跨平台证书加载 (Android 扫描 / Win/Linux/macOS 原生)
 │   ├── cloudflare/         # AS13335 IP 范围校验
 │   ├── config/             # 配置加载和校验
 │   ├── dns/                # DoH 查询 + DNS 缓存 + ECH 文件缓存
 │   ├── proxy/              # HTTP CONNECT + SOCKS5 代理
 │   └── tlsconn/            # ECH TLS 连接 (retry_configs + 多候选)
 ├── configs/                # 示例配置
-└── .github/workflows/      # CI 自动编译
+├── start.bat               # Windows 便捷启动脚本
+├── set-proxy.ps1           # 设置 Windows 系统代理
+├── unset-proxy.ps1         # 取消 Windows 系统代理
+└── .github/workflows/      # CI 自动编译 (含 Windows)
 ```
 
 ## 依赖

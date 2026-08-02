@@ -67,7 +67,7 @@ func NewWithCache(dohURL string, timeout, cacheTTL, cachePath string) *Resolver 
 	urls := parseDoHList(dohURL)
 
 	transport := &http.Transport{}
-	if pool := certutil.LoadAndroidCertPool(); pool != nil {
+	if pool := certutil.LoadSystemCertPool(); pool != nil {
 		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
 
