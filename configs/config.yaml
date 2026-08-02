@@ -5,7 +5,8 @@
 listen: "127.0.0.1:17171"
 
 # DoH 服务器地址（必须 HTTPS）
-# 国内推荐: https://0kbpekmcr1.cloudflare-gateway.com/dns-query
+# 支持多个端点，逗号分隔，按顺序尝试。国内推荐用 Cloudflare Gateway 端点。
+# 示例: "https://1.1.1.1/dns-query,https://cloudflare-dns.com/dns-query"
 doh: "https://1.1.1.1/dns-query"
 
 # 代理模式: http / socks5 / both
@@ -18,7 +19,8 @@ log_level: "info"
 tls:
   timeout: "15s"
   skip_verify: false
-  # ECH 失败后是否回退到普通 TLS
+  # ECH 失败后是否回退到普通 TLS（暴露 SNI）
+  # 如果 ech.no_downgrade=true，此选项自动被覆盖为 false
   fallback_plain: true
 
 # DNS 配置
@@ -26,8 +28,21 @@ dns:
   cache_ttl: "300s"
   timeout: "10s"
   prefer_ipv4: true
+  # ECH 配置文件缓存路径（可选）
+  # DoH 不可用时从文件读取上次缓存的 ECHConfig，TTL 12 小时
+  # cache_path: "/data/data/com.example.app/cache/ech_config.json"
 
 # 代理连接配置
 proxy:
   connect_timeout: "10s"
   idle_timeout: "120s"
+
+# ECH 专用配置
+ech:
+  # 自定义 Cloudflare 边缘 IP（逗号分隔）
+  # 只有 AS13335 IP 会被接受，其他自动过滤
+  # custom_ips: "104.20.8.2,104.20.9.2"
+  
+  # 禁止降级：ECH 主机永不回退到明文 TLS
+  # 设为 true 可防止 SNI 泄漏（抗审查部署推荐）
+  no_downgrade: false

@@ -1,60 +1,91 @@
-// Package dns 实现 DoH 查询和 DNS 缓存
+// Package dns implements DoH (DNS-over-HTTPS) queries and DNS caching.
+//
+// Improvements ported from production ECH proxy:
+//   - Multi-endpoint DoH: comma-separated URLs, tries each until one succeeds
+//   - Wire-format SVCB parsing (RFC 3597) in addition to textual ech= output
+//   - File-based ECH config cache with 12h TTL for faster cold starts
+//   - Stale cache fallback: serve expired entries when DoH is unreachable
 package dns
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anglesgirl/ech-proxy-go/internal/certutil"
 )
 
-// ECHConfig 存储 ECH 配置
+// ECHConfig stores the raw ECHConfigList bytes.
 type ECHConfig struct {
-	Config []byte // 原始 ECHConfigList 字节
+	Config []byte
 }
 
-// Result DNS 查询结果
+// Result is a DNS lookup result.
 type Result struct {
 	IPs      []net.IP
 	ECH      *ECHConfig
-	OuterSNI string // HTTPS 记录中的 outer SNI
+	OuterSNI string // HTTPS record's outer SNI (for ECH)
 	ExpireAt time.Time
 }
 
-// Resolver DoH 解析器，带 TTL 缓存
+// Resolver performs DoH queries with TTL-based caching.
 type Resolver struct {
-	dohURL   string
-	timeout  time.Duration
-	cacheTTL time.Duration
-	client   *http.Client
+	dohURLs   []string // comma-split list, tried in order
+	timeout   time.Duration
+	cacheTTL  time.Duration
+	cachePath string // optional file path for ECH config persistence
+	client    *http.Client
 
 	mu    sync.RWMutex
 	cache map[string]*Result
 }
 
-// New 创建 DoH 解析器
+// New creates a DoH resolver.
+// dohURL may be a comma-separated list of endpoints; each is tried in order.
 func New(dohURL string, timeout, cacheTTL time.Duration) *Resolver {
+	return NewWithCache(dohURL, timeout, cacheTTL, "")
+}
+
+// NewWithCache creates a resolver that persists ECH configs to a file.
+// When DoH is unreachable, the cached file is used instead.
+func NewWithCache(dohURL string, timeout, cacheTTL, cachePath string) *Resolver {
+	urls := parseDoHList(dohURL)
+
+	transport := &http.Transport{}
+	if pool := certutil.LoadAndroidCertPool(); pool != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+
 	return &Resolver{
-		dohURL:   dohURL,
-		timeout:  timeout,
-		cacheTTL: cacheTTL,
-		client:   &http.Client{Timeout: timeout},
-		cache:    make(map[string]*Result),
+		dohURLs:   urls,
+		timeout:   timeout,
+		cacheTTL:  cacheTTL,
+		cachePath: cachePath,
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		},
+		cache: make(map[string]*Result),
 	}
 }
 
-// Lookup 查询域名，优先返回缓存结果
+// Lookup resolves a hostname, returning cached results when available.
 func (r *Resolver) Lookup(hostname string, preferIPv4 bool) (*Result, error) {
-	// 查缓存
 	r.mu.RLock()
 	if cached, ok := r.cache[hostname]; ok && time.Now().Before(cached.ExpireAt) {
 		r.mu.RUnlock()
@@ -62,18 +93,23 @@ func (r *Resolver) Lookup(hostname string, preferIPv4 bool) (*Result, error) {
 	}
 	r.mu.RUnlock()
 
-	// 并发查询 A/AAAA/HTTPS
 	result, err := r.dohLookup(hostname)
 	if err != nil {
+		// Stale cache fallback: serve expired entry rather than failing.
+		r.mu.RLock()
+		if stale, ok := r.cache[hostname]; ok && len(stale.IPs) > 0 {
+			r.mu.RUnlock()
+			log.Printf("[dns] DoH failed for %s, using stale cache: %v", hostname, err)
+			return stale, nil
+		}
+		r.mu.RUnlock()
 		return nil, err
 	}
 
-	// IP 排序：优先 IPv4
 	if preferIPv4 {
 		r.sortIPv4First(result.IPs)
 	}
 
-	// 写缓存
 	result.ExpireAt = time.Now().Add(r.cacheTTL)
 	r.mu.Lock()
 	r.cache[hostname] = result
@@ -82,23 +118,98 @@ func (r *Resolver) Lookup(hostname string, preferIPv4 bool) (*Result, error) {
 	return result, nil
 }
 
-// ClearCache 清空 DNS 缓存
+// ClearCache clears the in-memory DNS cache.
 func (r *Resolver) ClearCache() {
 	r.mu.Lock()
 	r.cache = make(map[string]*Result)
 	r.mu.Unlock()
 }
 
+// DoHURLs returns the configured DoH endpoints.
+func (r *Resolver) DoHURLs() []string {
+	return r.dohURLs
+}
+
 func (r *Resolver) sortIPv4First(ips []net.IP) {
 	for i := 0; i < len(ips); i++ {
 		if ips[i].To4() != nil {
-			// 把 IPv4 移到前面
 			if i != 0 {
 				ips[0], ips[i] = ips[i], ips[0]
 			}
 			break
 		}
 	}
+}
+
+// --- multi-endpoint DoH query ---
+
+type dohResponse struct {
+	Status int `json:"Status"`
+	Answer []struct {
+		Type int    `json:"type"`
+		Data string `json:"data"`
+	} `json:"Answer"`
+}
+
+func (r *Resolver) dohQuery(hostname, qtype string) (*dohResponse, error) {
+	var lastErr error
+	for _, base := range r.dohURLs {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			continue
+		}
+
+		u, err := url.Parse(base)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		q := u.Query()
+		q.Set("name", hostname)
+		q.Set("type", qtype)
+		u.RawQuery = q.Encode()
+
+		req, err := http.NewRequest("GET", u.String(), nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Accept", "application/dns-json")
+
+		resp, err := r.client.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("[dns] DoH query via %s failed: %v", base, err)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			lastErr = fmt.Errorf("DoH HTTP %d via %s", resp.StatusCode, base)
+			continue
+		}
+
+		var dr dohResponse
+		if err := json.Unmarshal(body, &dr); err != nil {
+			lastErr = fmt.Errorf("JSON parse via %s: %w", base, err)
+			continue
+		}
+		if dr.Status != 0 {
+			lastErr = fmt.Errorf("DoH DNS status %d via %s", dr.Status, base)
+			continue
+		}
+		return &dr, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no DoH endpoint configured")
+	}
+	return nil, lastErr
 }
 
 func (r *Resolver) dohLookup(hostname string) (*Result, error) {
@@ -114,11 +225,11 @@ func (r *Resolver) dohLookup(hostname string) (*Result, error) {
 	ch := make(chan queryResult, 3)
 
 	go func() {
-		ips, err := r.queryType(hostname, 1)
+		ips, err := r.queryType(hostname, "A")
 		ch <- queryResult{ips: ips, err: err}
 	}()
 	go func() {
-		ips, err := r.queryType(hostname, 28)
+		ips, err := r.queryType(hostname, "AAAA")
 		ch <- queryResult{ips: ips, err: err}
 	}()
 	go func() {
@@ -126,10 +237,14 @@ func (r *Resolver) dohLookup(hostname string) (*Result, error) {
 		ch <- queryResult{ech: ech, outerName: outerName, err: err}
 	}()
 
+	var firstErr error
 	for i := 0; i < 3; i++ {
 		qr := <-ch
 		if qr.err != nil {
 			log.Printf("[dns] query error for %s: %v", hostname, qr.err)
+			if firstErr == nil {
+				firstErr = qr.err
+			}
 			continue
 		}
 		if qr.ips != nil {
@@ -144,236 +259,273 @@ func (r *Resolver) dohLookup(hostname string) (*Result, error) {
 	}
 
 	if len(result.IPs) == 0 {
-		return nil, fmt.Errorf("no DNS results for %s", hostname)
+		if firstErr == nil {
+			firstErr = errors.New("no A/AAAA records returned")
+		}
+		return nil, firstErr
 	}
 
 	return result, nil
 }
 
-func (r *Resolver) queryType(hostname string, qtype int) ([]net.IP, error) {
-	u, err := url.Parse(r.dohURL)
+func (r *Resolver) queryType(hostname, qtype string) ([]net.IP, error) {
+	dr, err := r.dohQuery(hostname, qtype)
 	if err != nil {
 		return nil, err
 	}
 
-	q := u.Query()
-	q.Set("name", hostname)
-	q.Set("type", fmt.Sprintf("%d", qtype))
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequest("GET", u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var dohResp struct {
-		Status int `json:"Status"`
-		Answer []struct {
-			Type int    `json:"type"`
-			Data string `json:"data"`
-		} `json:"Answer"`
-	}
-
-	if err := json.Unmarshal(body, &dohResp); err != nil {
-		return nil, fmt.Errorf("JSON parse: %w (body: %s)", err, truncStr(string(body), 200))
-	}
-	if dohResp.Status != 0 {
-		return nil, fmt.Errorf("DoH status: %d", dohResp.Status)
+	typeNum := 1 // A
+	if qtype == "AAAA" {
+		typeNum = 28
 	}
 
 	var ips []net.IP
-	for _, ans := range dohResp.Answer {
-		if ans.Type == qtype {
-			switch qtype {
-			case 1: // A
-				if ip := net.ParseIP(ans.Data); ip != nil && ip.To4() != nil {
-					ips = append(ips, ip)
-				}
-			case 28: // AAAA
-				if ip := net.ParseIP(ans.Data); ip != nil && ip.To4() == nil {
-					ips = append(ips, ip)
-				}
+	for _, ans := range dr.Answer {
+		if ans.Type != typeNum {
+			continue
+		}
+		if ip := net.ParseIP(ans.Data); ip != nil {
+			if qtype == "A" && ip.To4() != nil {
+				ips = append(ips, ip)
+			} else if qtype == "AAAA" && ip.To4() == nil {
+				ips = append(ips, ip)
 			}
 		}
 	}
 	return ips, nil
 }
 
+// --- HTTPS (type 65) record parsing ---
+
+// echParamRe matches "ech=<base64>" in textual SVCB output.
+var echParamRe = regexp.MustCompile(`(?:^|\s)ech="?([A-Za-z0-9+/=]+)"?`)
+
 func (r *Resolver) queryHTTPS(hostname string) (*ECHConfig, string, error) {
-	u, err := url.Parse(r.dohURL)
+	dr, err := r.dohQuery(hostname, "HTTPS")
 	if err != nil {
 		return nil, "", err
 	}
 
-	q := u.Query()
-	q.Set("name", hostname)
-	q.Set("type", "65")
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequest("GET", u.String(), nil)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	var dohResp struct {
-		Status int `json:"Status"`
-		Answer []struct {
-			Type int    `json:"type"`
-			Data string `json:"data"`
-		} `json:"Answer"`
-	}
-
-	if err := json.Unmarshal(body, &dohResp); err != nil {
-		return nil, "", fmt.Errorf("JSON parse: %w", err)
-	}
-	if dohResp.Status != 0 {
-		return nil, "", fmt.Errorf("DoH status: %d", dohResp.Status)
-	}
-
-	for _, ans := range dohResp.Answer {
+	for _, ans := range dr.Answer {
 		if ans.Type != 65 {
 			continue
 		}
 		data := ans.Data
 
-		if strings.HasPrefix(data, "\\#") {
-			ech, outerName, err := parseHTTPSRecordHex(data)
+		// Format 1: textual SVCB — "1 . ech=<base64> alpn=h2"
+		if match := echParamRe.FindStringSubmatch(data); match != nil {
+			value, err := base64.StdEncoding.DecodeString(match[1])
 			if err != nil {
-				log.Printf("[dns] parse HTTPS hex: %v", err)
-				continue
+				return nil, "", fmt.Errorf("ECH base64 decode: %w", err)
 			}
-			if ech != nil {
-				return ech, outerName, nil
-			}
+			outerName := extractOuterSNI(data)
+			return &ECHConfig{Config: value}, outerName, nil
 		}
 
-		if strings.Contains(data, "ech=") {
-			ech, outerName, err := parseHTTPSRecordText(data)
-			if err != nil {
-				log.Printf("[dns] parse HTTPS text: %v", err)
-				continue
-			}
-			if ech != nil {
-				return ech, outerName, nil
-			}
+		// Format 2: RFC 3597 wire format — "\\# <len> <hex>"
+		if ech, outerName, err := parseSVCBWire(data); err == nil && ech != nil {
+			return &ECHConfig{Config: ech}, outerName, nil
 		}
 	}
 	return nil, "", nil
 }
 
-// === HTTPS 记录解析 ===
-
-func parseHTTPSRecordHex(data string) (*ECHConfig, string, error) {
-	parts := strings.SplitN(data, " ", 3)
-	if len(parts) < 3 {
-		return nil, "", fmt.Errorf("invalid hex format")
-	}
-	hexStr := strings.ReplaceAll(parts[2], " ", "")
-	raw, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return nil, "", fmt.Errorf("hex decode: %w", err)
-	}
-	return parseHTTPSRecordBinary(raw)
-}
-
-func parseHTTPSRecordText(data string) (*ECHConfig, string, error) {
+func extractOuterSNI(data string) string {
 	parts := strings.Fields(data)
 	if len(parts) < 2 {
-		return nil, "", fmt.Errorf("invalid text format")
+		return ""
 	}
-
 	outerName := parts[1]
 	if outerName == "." {
-		outerName = ""
+		return ""
 	}
-
-	for _, p := range parts[2:] {
-		if strings.HasPrefix(p, "ech=") {
-			echBase64 := strings.TrimPrefix(p, "ech=")
-			echBase64 = strings.Trim(echBase64, "\"")
-			echBytes, err := base64.StdEncoding.DecodeString(echBase64)
-			if err != nil {
-				return nil, "", fmt.Errorf("ech base64 decode: %w", err)
-			}
-			return &ECHConfig{Config: echBytes}, outerName, nil
-		}
-	}
-	return nil, outerName, nil
+	return strings.TrimSuffix(outerName, ".")
 }
 
-func parseHTTPSRecordBinary(raw []byte) (*ECHConfig, string, error) {
-	if len(raw) < 2 {
-		return nil, "", fmt.Errorf("record too short")
+// parseSVCBWire extracts the ech SvcParam (key 5) from RFC 3597 wire format.
+func parseSVCBWire(data string) ([]byte, string, error) {
+	if !strings.HasPrefix(data, `\# `) {
+		return nil, "", fmt.Errorf("not RFC3597 wire format")
+	}
+	parts := strings.Fields(data)
+	if len(parts) < 3 {
+		return nil, "", fmt.Errorf("malformed RFC3597 wire format")
+	}
+	hexStr := strings.Join(parts[2:], "")
+	wire, err := hex.DecodeString(hexStr)
+	if err != nil || len(wire) < 3 {
+		return nil, "", fmt.Errorf("invalid SVCB wire data")
 	}
 
-	idx := 2 // 跳过 SvcPriority
+	pos := 2 // skip SvcPriority
 
-	// TargetName (DNS 域名格式，以 0 结尾)
+	// Parse TargetName (DNS name format, null-terminated)
 	outerName := ""
-	for idx < len(raw) {
-		labelLen := int(raw[idx])
-		idx++
-		if labelLen == 0 {
-			break
+	for pos < len(wire) && wire[pos] != 0 {
+		labelLen := int(wire[pos])
+		pos++
+		if pos+labelLen > len(wire) {
+			return nil, "", fmt.Errorf("invalid SVCB target name")
 		}
-		if idx+labelLen > len(raw) {
-			return nil, "", fmt.Errorf("invalid target name")
-		}
-		label := string(raw[idx : idx+labelLen])
+		label := string(wire[pos : pos+labelLen])
 		if outerName == "" {
 			outerName = label
 		} else {
 			outerName += "." + label
 		}
-		idx += labelLen
+		pos += labelLen
 	}
+	pos++ // skip null terminator
 
-	// SvcParams
-	for idx+4 <= len(raw) {
-		svcKey := binary.BigEndian.Uint16(raw[idx:])
-		valLen := int(binary.BigEndian.Uint16(raw[idx+2:]))
-		idx += 4
-		if idx+valLen > len(raw) {
+	// Parse SvcParams (key-length-value triples)
+	for pos+4 <= len(wire) {
+		key := int(binary.BigEndian.Uint16(wire[pos:]))
+		valLen := int(binary.BigEndian.Uint16(wire[pos+2:]))
+		pos += 4
+		if pos+valLen > len(wire) {
 			break
 		}
-		val := raw[idx : idx+valLen]
-		idx += valLen
-
-		// svcKey 5 = ech
-		if svcKey == 5 && len(val) >= 2 {
-			return &ECHConfig{Config: val}, outerName, nil
+		if key == 5 { // SvcParamKey 5 = ech
+			return append([]byte(nil), wire[pos:pos+valLen]...), outerName, nil
 		}
+		pos += valLen
 	}
-	return nil, outerName, nil
+	return nil, outerName, fmt.Errorf("no ECH SvcParam found")
 }
 
-func truncStr(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+// --- file-based ECH config cache ---
+
+const publicECHCacheTTL = 12 * time.Hour
+
+type publicECHCache struct {
+	Host      string `json:"host"`
+	ConfigB64 string `json:"config_b64"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+func LoadECHCacheFile(path, host string) []byte {
+	if strings.TrimSpace(path) == "" {
+		return nil
 	}
-	return s
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var record publicECHCache
+	if json.Unmarshal(data, &record) != nil {
+		return nil
+	}
+	if !strings.EqualFold(record.Host, host) {
+		return nil
+	}
+	if record.ExpiresAt <= time.Now().Unix() {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(record.ConfigB64)
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+func StoreECHCacheFile(path, host string, config []byte) {
+	if strings.TrimSpace(path) == "" || len(config) == 0 {
+		return
+	}
+	record, err := json.Marshal(publicECHCache{
+		Host:      strings.ToLower(host),
+		ConfigB64: base64.StdEncoding.EncodeToString(config),
+		ExpiresAt: time.Now().Add(publicECHCacheTTL).Unix(),
+	})
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(dir, ".echconfig-")
+	if err != nil {
+		return
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.Write(record); err != nil {
+		tmp.Close()
+		return
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(name, path)
+}
+
+// FetchECHConfig retrieves the ECH config for a host, using the file cache
+// as a fallback when DoH is unreachable.
+func (r *Resolver) FetchECHConfig(host string) ([]byte, string, error) {
+	ech, outerName, err := r.queryHTTPS(host)
+	if err == nil && ech != nil {
+		if r.cachePath != "" {
+			StoreECHCacheFile(r.cachePath, host, ech.Config)
+		}
+		return ech.Config, outerName, nil
+	}
+
+	if r.cachePath != "" {
+		if cached := LoadECHCacheFile(r.cachePath, host); cached != nil {
+			log.Printf("[dns] using file-cached ECH config for %s (DoH failed: %v)", host, err)
+			return cached, "", nil
+		}
+	}
+
+	if err != nil {
+		return nil, "", fmt.Errorf("ECH config for %s: %w", host, err)
+	}
+	return nil, "", fmt.Errorf("no ECH config available for %s", host)
+}
+
+// FetchTxt looks up TXT records over DoH and returns them joined by newlines.
+func (r *Resolver) FetchTxt(name string) (string, error) {
+	dr, err := r.dohQuery(name, "TXT")
+	if err != nil {
+		return "", err
+	}
+	var lines []string
+	quotedRe := regexp.MustCompile(`"([^"]*)"`)
+	for _, a := range dr.Answer {
+		if a.Type != 16 {
+			continue
+		}
+		s := a.Data
+		if m := quotedRe.FindAllStringSubmatch(s, -1); len(m) > 0 {
+			var b strings.Builder
+			for _, g := range m {
+				b.WriteString(g[1])
+			}
+			s = b.String()
+		}
+		s = strings.TrimSpace(s)
+		if s != "" {
+			lines = append(lines, s)
+		}
+	}
+	if len(lines) == 0 {
+		return "", fmt.Errorf("no TXT records found for %s", name)
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func parseDoHList(s string) []string {
+	var urls []string
+	for _, u := range strings.Split(s, ",") {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			urls = append(urls, u)
+		}
+	}
+	return urls
 }

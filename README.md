@@ -6,7 +6,7 @@
 
 1. 监听本地端口，接受 HTTP CONNECT / SOCKS5 代理请求
 2. 通过 DoH 查询目标域名的 A/AAAA + HTTPS(type 65) 记录
-3. 从 HTTPS 记录中提取 ECHConfig
+3. 从 HTTPS 记录中提取 ECHConfig（支持文本格式和 RFC 3597 线格式）
 4. 用 Go 1.23+ `crypto/tls` 原生 ECH 支持建立 TLS 连接
 5. 双向转发数据
 
@@ -14,8 +14,13 @@
 
 - **HTTP CONNECT 代理** — 标准 HTTP 代理协议，任何 HTTP 客户端可用
 - **SOCKS5 代理** — 同时支持 SOCKS5 协议
-- **DNS 缓存** — 带 TTL 的 DNS 结果缓存，减少 DoH 查询
-- **ECH 回退** — ECH 失败时自动回退到普通 TLS
+- **多 DoH 端点** — 逗号分隔多个 DoH URL，按顺序尝试，适合 GFW 环境
+- **DNS 缓存** — 带 TTL 的内存缓存 + 过期条目兜底
+- **ECH 配置文件缓存** — 12 小时 TTL 文件缓存，DoH 不可用时自动回退
+- **ECH 拒绝重试** — 服务器拒绝 ECH 时自动使用 `retry_configs` 重试
+- **禁止降级模式** — `no_downgrade` 选项防止 ECH 主机回退到明文 TLS（保护 SNI）
+- **AS13335 IP 校验** — 自定义边缘 IP 只接受 Cloudflare AS13335 地址
+- **Android 证书池** — 自动加载 Android 系统 CA 证书（DER + PEM）
 - **配置文件** — YAML 配置文件，灵活可配
 - **优雅关闭** — 支持 SIGINT/SIGTERM 信号优雅退出
 - **跨平台** — 纯 Go 静态编译，支持 Linux/Android/macOS/Windows
@@ -71,7 +76,8 @@ val client = OkHttpClient.Builder().proxy(proxy).build()
 
 ```yaml
 listen: "127.0.0.1:17171"
-doh: "https://1.1.1.1/dns-query"
+# 支持多个 DoH 端点，逗号分隔
+doh: "https://1.1.1.1/dns-query,https://cloudflare-dns.com/dns-query"
 mode: "http"           # http / socks5 / both
 tls:
   timeout: "15s"
@@ -79,20 +85,34 @@ tls:
 dns:
   cache_ttl: "300s"
   prefer_ipv4: true
+  cache_path: "/tmp/ech_config.json"  # ECH 配置文件缓存（可选）
+ech:
+  custom_ips: "104.20.8.2,104.20.9.2"  # 自定义 Cloudflare 边缘 IP
+  no_downgrade: false                    # 禁止降级到明文 TLS
 ```
+
+### 环境变量覆盖
+
+| 变量 | 说明 |
+|------|------|
+| `DOH_URL` | 覆盖 DoH 地址 |
+| `LISTEN_ADDR` | 覆盖监听地址 |
+| `ECH_CUSTOM_IPS` | 覆盖自定义边缘 IP |
 
 ## 项目结构
 
 ```
 ech-proxy-go/
-├── cmd/ech-proxy/       # 主入口
+├── cmd/ech-proxy/          # 主入口
 ├── internal/
-│   ├── config/          # 配置加载和校验
-│   ├── dns/             # DoH 查询 + DNS 缓存
-│   ├── proxy/           # HTTP CONNECT + SOCKS5 代理
-│   └── tlsconn/         # ECH TLS 连接
-├── configs/             # 示例配置
-└── .github/workflows/   # CI 自动编译
+│   ├── certutil/           # Android 证书池加载 (DER + PEM)
+│   ├── cloudflare/         # AS13335 IP 范围校验
+│   ├── config/             # 配置加载和校验
+│   ├── dns/                # DoH 查询 + DNS 缓存 + ECH 文件缓存
+│   ├── proxy/              # HTTP CONNECT + SOCKS5 代理
+│   └── tlsconn/            # ECH TLS 连接 (retry_configs + 多候选)
+├── configs/                # 示例配置
+└── .github/workflows/      # CI 自动编译
 ```
 
 ## 依赖

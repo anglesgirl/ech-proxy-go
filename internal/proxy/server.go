@@ -1,4 +1,4 @@
-// Package proxy 实现 HTTP CONNECT 和 SOCKS5 代理
+// Package proxy implements HTTP CONNECT and SOCKS5 proxy.
 package proxy
 
 import (
@@ -17,7 +17,7 @@ import (
 	"github.com/anglesgirl/ech-proxy-go/internal/tlsconn"
 )
 
-// Server 代理服务器
+// Server is the proxy server.
 type Server struct {
 	cfg      *config.Config
 	resolver *dns.Resolver
@@ -25,7 +25,7 @@ type Server struct {
 	server   *http.Server
 }
 
-// New 创建代理服务器
+// New creates a proxy server from configuration.
 func New(cfg *config.Config) *Server {
 	tlsTimeout, _ := time.ParseDuration(cfg.TLS.Timeout)
 	dnsTimeout, _ := time.ParseDuration(cfg.DNS.Timeout)
@@ -36,9 +36,26 @@ func New(cfg *config.Config) *Server {
 	if tlsTimeout == 0 {
 		tlsTimeout = 15 * time.Second
 	}
+	if dnsTimeout == 0 {
+		dnsTimeout = 10 * time.Second
+	}
+	if cacheTTL == 0 {
+		cacheTTL = 300 * time.Second
+	}
 
-	resolver := dns.New(cfg.DoH, dnsTimeout, cacheTTL)
-	dialer := tlsconn.New(tlsTimeout, cfg.TLS.SkipVerify, cfg.TLS.FallbackPlain)
+	resolver := dns.NewWithCache(cfg.DoH, dnsTimeout, cacheTTL, cfg.DNS.CachePath)
+
+	// No-downgrade mode disables plain TLS fallback for ECH-capable hosts.
+	fallbackPlain := cfg.TLS.FallbackPlain
+	if cfg.ECH.NoDowngrade {
+		fallbackPlain = false
+	}
+
+	dialer := tlsconn.New(tlsTimeout, cfg.TLS.SkipVerify, fallbackPlain)
+	if cfg.ECH.CustomIPs != "" {
+		dialer.SetCustomIPs(cfg.ECH.CustomIPs)
+		log.Printf("[proxy] custom edge IPs configured: %s", cfg.ECH.CustomIPs)
+	}
 
 	srv := &Server{
 		cfg:      cfg,
@@ -50,14 +67,14 @@ func New(cfg *config.Config) *Server {
 		Addr:         cfg.Listen,
 		Handler:      http.HandlerFunc(srv.handleHTTP),
 		ReadTimeout:  connectTimeout,
-		WriteTimeout: 0, // CONNECT 后需要长连接
+		WriteTimeout: 0, // CONNECT needs long-lived connections
 		IdleTimeout:  idleTimeout,
 	}
 
 	return srv
 }
 
-// ListenAndServe 启动代理服务
+// ListenAndServe starts the proxy.
 func (s *Server) ListenAndServe() error {
 	mode := strings.ToLower(s.cfg.Mode)
 	log.Printf("[proxy] starting on %s (mode=%s doh=%s)", s.cfg.Listen, mode, s.cfg.DoH)
@@ -70,17 +87,16 @@ func (s *Server) ListenAndServe() error {
 		return s.server.ListenAndServe()
 	}
 
-	// socks5 only: 阻塞等待
-	select {}
+	select {} // socks5 only: block forever
 }
 
-// Shutdown 优雅关闭
+// Shutdown gracefully stops the proxy.
 func (s *Server) Shutdown(ctx context.Context) error {
 	log.Printf("[proxy] shutting down...")
 	return s.server.Shutdown(ctx)
 }
 
-// handleHTTP 处理 HTTP CONNECT 请求
+// handleHTTP handles HTTP CONNECT requests.
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	host, port, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -90,13 +106,11 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[http] CONNECT %s:%s", host, port)
 
-	// 非 443 端口直接 TCP 转发
 	if port != "443" {
 		s.handlePlainForward(w, r, host, port)
 		return
 	}
 
-	// DoH 查询
 	result, err := s.resolver.Lookup(host, s.cfg.DNS.PreferIPv4)
 	if err != nil {
 		log.Printf("[http] DoH failed for %s: %v", host, err)
@@ -104,7 +118,6 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hijack 连接
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
@@ -119,7 +132,6 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	// ECH TLS 连接
 	targetConn, err := s.dialer.DialECH(host, result)
 	if err != nil {
 		log.Printf("[http] ECH dial failed for %s: %v", host, err)
@@ -132,7 +144,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	Relay(clientConn, targetConn)
 }
 
-// handlePlainForward 非 HTTPS TCP 转发
+// handlePlainForward handles non-HTTPS TCP forwarding.
 func (s *Server) handlePlainForward(w http.ResponseWriter, r *http.Request, host, port string) {
 	target := net.JoinHostPort(host, port)
 	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
@@ -158,8 +170,7 @@ func (s *Server) handlePlainForward(w http.ResponseWriter, r *http.Request, host
 	Relay(clientConn, conn)
 }
 
-// listenSOCKS5 启动 SOCKS5 代理
-// SOCKS5 监听在 HTTP 端口 +1 上
+// listenSOCKS5 starts the SOCKS5 proxy on port+1.
 func (s *Server) listenSOCKS5() {
 	addr := s.socks5Addr()
 	log.Printf("[socks5] starting on %s", addr)
@@ -191,7 +202,6 @@ func (s *Server) socks5Addr() string {
 func (s *Server) handleSOCKS5(conn net.Conn) {
 	defer conn.Close()
 
-	// SOCKS5 握手
 	buf := make([]byte, 256)
 	_, err := conn.Read(buf)
 	if err != nil {
@@ -200,29 +210,27 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 	if buf[0] != 0x05 {
 		return
 	}
-	// 无需认证
 	conn.Write([]byte{0x05, 0x00})
 
-	// 读取请求
 	n, err := conn.Read(buf)
 	if err != nil || n < 7 {
 		return
 	}
 	if buf[0] != 0x05 || buf[1] != 0x01 {
-		return // 只支持 CONNECT
+		return
 	}
 
 	var host string
 	var port int
 	switch buf[3] {
-	case 0x01: // IPv4
+	case 0x01:
 		host = net.IP(buf[4:8]).String()
 		port = int(buf[8])<<8 | int(buf[9])
-	case 0x03: // 域名
+	case 0x03:
 		domainLen := int(buf[4])
 		host = string(buf[5 : 5+domainLen])
 		port = int(buf[5+domainLen])<<8 | int(buf[6+domainLen])
-	case 0x04: // IPv6
+	case 0x04:
 		host = net.IP(buf[4:20]).String()
 		port = int(buf[20])<<8 | int(buf[21])
 	default:
@@ -234,7 +242,6 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 	var targetConn net.Conn
 
 	if port == 443 && isDomain(host) {
-		// HTTPS: 走 ECH
 		result, err := s.resolver.Lookup(host, s.cfg.DNS.PreferIPv4)
 		if err != nil {
 			log.Printf("[socks5] DoH failed: %v", err)
@@ -248,7 +255,6 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 			return
 		}
 	} else {
-		// 非 443 或 IP 直连
 		targetConn, err = net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
 		if err != nil {
 			log.Printf("[socks5] dial failed: %v", err)
@@ -258,13 +264,12 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 	}
 	defer targetConn.Close()
 
-	// 成功响应
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
 	Relay(conn, targetConn)
 }
 
-// Relay 双向转发数据
+// Relay bidirectionally forwards data between two connections.
 func Relay(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	var wg sync.WaitGroup
