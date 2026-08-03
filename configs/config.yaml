@@ -29,7 +29,9 @@ dns:
   timeout: "10s"
   prefer_ipv4: true
   # ECH 配置文件缓存路径（可选）
-  # DoH 不可用时从文件读取上次缓存的 ECHConfig，TTL 12 小时
+  # ECH 公钥配置缓存 5 小时,期间连接直接读缓存握手(不再实时查 DoH)。
+  # 获取顺序: 本地缓存 → cloudflare-ech.com 官方公钥 → 目标自身 HTTPS ech=
+  # 握手被拒时用 server retry_configs 兜底一次并缓存;再失败降级普通 TLS。
   # Windows: "ech_config.json" (同目录) 或 "%LOCALAPPDATA%\ech-proxy\ech_config.json"
   # Linux:   "/tmp/ech_config.json"
   # Android: "/data/data/com.example.app/cache/ech_config.json"

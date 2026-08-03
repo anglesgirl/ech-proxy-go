@@ -63,7 +63,7 @@ func New(dohURL string, timeout, cacheTTL time.Duration) *Resolver {
 
 // NewWithCache creates a resolver that persists ECH configs to a file.
 // When DoH is unreachable, the cached file is used instead.
-func NewWithCache(dohURL string, timeout, cacheTTL, cachePath string) *Resolver {
+func NewWithCache(dohURL string, timeout, cacheTTL time.Duration, cachePath string) *Resolver {
 	urls := parseDoHList(dohURL)
 
 	transport := &http.Transport{}
@@ -395,7 +395,10 @@ func parseSVCBWire(data string) ([]byte, string, error) {
 
 // --- file-based ECH config cache ---
 
-const publicECHCacheTTL = 12 * time.Hour
+// ECH 公钥配置缓存 5 小时:公钥轮换频率远低于此,期间连接直接用缓存握手,
+// 避免每次启动/换 host 都实时查 DoH。兜底配置(server retry_configs /
+// cloudflare-ech.com / 目标自身 ech=)同样缓存,失败后降级普通 TLS。
+const publicECHCacheTTL = 5 * time.Hour
 
 type publicECHCache struct {
 	Host      string `json:"host"`
@@ -464,27 +467,49 @@ func StoreECHCacheFile(path, host string, config []byte) {
 	_ = os.Rename(name, path)
 }
 
-// FetchECHConfig retrieves the ECH config for a host, using the file cache
-// as a fallback when DoH is unreachable.
-func (r *Resolver) FetchECHConfig(host string) ([]byte, string, error) {
-	ech, outerName, err := r.queryHTTPS(host)
-	if err == nil && ech != nil {
-		if r.cachePath != "" {
-			StoreECHCacheFile(r.cachePath, host, ech.Config)
-		}
-		return ech.Config, outerName, nil
-	}
+// cloudflareECHHost 是 Cloudflare 官方的 ECH 公钥发布点。它的 HTTPS 记录里
+// 带 ech= 参数,代表 Cloudflare 边缘的当前 ECH 公钥,适用于所有 Cloudflare
+// 托管的 AS13335 目标(archiveofourown.org 即其中之一)。
+const cloudflareECHHost = "cloudflare-ech.com"
 
+// CacheECHConfig persists an ECHConfigList for a host to the disk cache.
+// Exported so the dialer can cache server-provided retry_configs too.
+func (r *Resolver) CacheECHConfig(host string, config []byte) {
+	if r.cachePath != "" && len(config) > 0 {
+		StoreECHCacheFile(r.cachePath, host, config)
+	}
+}
+
+// FetchECHConfig returns the ECHConfigList for an AS13335 host, trying in order:
+//  1. the local 5h disk cache (learned from a previous fetch or retry_configs)
+//  2. cloudflare-ech.com's HTTPS ech= (Cloudflare's official ECH public key)
+//  3. the target's own HTTPS ech= record
+//
+// The first successful source is persisted to the cache so subsequent
+// connections handshake straight from cache without another DoH round-trip.
+func (r *Resolver) FetchECHConfig(host string) ([]byte, string, error) {
+	// 1. Cache first:握手用缓存配置,不发 DoH。
 	if r.cachePath != "" {
 		if cached := LoadECHCacheFile(r.cachePath, host); cached != nil {
-			log.Printf("[dns] using file-cached ECH config for %s (DoH failed: %v)", host, err)
+			log.Printf("[dns] using file-cached ECH config for %s", host)
 			return cached, "", nil
 		}
 	}
 
-	if err != nil {
-		return nil, "", fmt.Errorf("ECH config for %s: %w", host, err)
+	// 2. Cloudflare 官方 ECH 公钥(适用所有 CF 站点)。
+	if ech, outer, err := r.queryHTTPS(cloudflareECHHost); err == nil && ech != nil {
+		r.CacheECHConfig(host, ech.Config)
+		log.Printf("[dns] ECH config for %s from %s (outer=%s)", host, cloudflareECHHost, outer)
+		return ech.Config, outer, nil
 	}
+
+	// 3. 目标自身 HTTPS 记录的 ech=。
+	if ech, outerName, err := r.queryHTTPS(host); err == nil && ech != nil {
+		r.CacheECHConfig(host, ech.Config)
+		log.Printf("[dns] ECH config for %s from target HTTPS ech=", host)
+		return ech.Config, outerName, nil
+	}
+
 	return nil, "", fmt.Errorf("no ECH config available for %s", host)
 }
 

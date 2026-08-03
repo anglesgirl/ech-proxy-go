@@ -16,9 +16,10 @@
 - **SOCKS5 代理** — 同时支持 SOCKS5 协议
 - **多 DoH 端点** — 逗号分隔多个 DoH URL，按顺序尝试，适合 GFW 环境
 - **DNS 缓存** — 带 TTL 的内存缓存 + 过期条目兜底
-- **ECH 配置文件缓存** — 12 小时 TTL 文件缓存，DoH 不可用时自动回退
-- **ECH 拒绝重试** — 服务器拒绝 ECH 时自动使用 `retry_configs` 重试
-- **禁止降级模式** — `no_downgrade` 选项防止 ECH 主机回退到明文 TLS（保护 SNI）
+- **ECH 配置文件缓存** — 5 小时 TTL 文件缓存，缓存优先（不查 DoH 直接握手）
+- **Cloudflare 官方 ECH 公钥** — 优先从 `cloudflare-ech.com` 获取，适用所有 CF 站点
+- **ECH 拒绝重试** — 服务器拒绝 ECH 时自动使用 `retry_configs` 重试并缓存该配置
+- **保护性降级** — ECH 全部失败后回退普通 TLS 保证连通（`no_downgrade` 可关闭）
 - **AS13335 IP 校验** — 自定义边缘 IP 只接受 Cloudflare AS13335 地址
 - **跨平台证书** — Android 扫描系统证书目录 (DER+PEM)；Windows/Linux/macOS 使用 OS 原生证书库
 - **配置文件** — YAML 配置文件，灵活可配

@@ -56,6 +56,11 @@ func New(cfg *config.Config) *Server {
 		dialer.SetCustomIPs(cfg.ECH.CustomIPs)
 		log.Printf("[proxy] custom edge IPs configured: %s", cfg.ECH.CustomIPs)
 	}
+	// ECH 握手被拒且服务器给了 retry_configs 时,缓存到磁盘供下次直接使用。
+	dialer.SetRetryConfigSink(func(host string, config []byte) {
+		resolver.CacheECHConfig(host, config)
+		log.Printf("[proxy] cached server retry_configs for %s (%d bytes)", host, len(config))
+	})
 
 	srv := &Server{
 		cfg:      cfg,

@@ -32,6 +32,15 @@ type Dialer struct {
 	fallbackPlain bool // ECH failed → plain TLS (set false for protected hosts)
 	customIPs     []string
 	certPool      *tls.Config
+	// onRetryConfig, when set, persists a server-provided retry_configs to the
+	// disk cache so the next connection handshakes straight from cache.
+	onRetryConfig func(host string, config []byte)
+}
+
+// SetRetryConfigSink registers a callback that receives server-provided
+// retry_configs after a successful ECH rejection retry, so they can be cached.
+func (d *Dialer) SetRetryConfigSink(fn func(host string, config []byte)) {
+	d.onRetryConfig = fn
 }
 
 // New creates an ECH dialer.
@@ -114,8 +123,12 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 			retryConfig.EncryptedClientHelloConfigList = rej.RetryConfigList
 			conn, retryErr := d.dialTLS(addr, retryConfig, hostname)
 			if retryErr == nil {
-				if conn.ConnectionState().ECHAccepted {
+				if tlsConn, ok := conn.(*tls.Conn); ok && tlsConn.ConnectionState().ECHAccepted {
 					log.Printf("[tls] ECH accepted via %s (retry_configs)", addr)
+				}
+				// 缓存 server retry_configs,下次直接用它握手。
+				if d.onRetryConfig != nil {
+					d.onRetryConfig(hostname, rej.RetryConfigList)
 				}
 				return conn, nil
 			}
@@ -212,10 +225,9 @@ func NewWithCache(d *Dialer, resolver *dns.Resolver) *DialerWithCache {
 // DialContext implements the http.Transport DialTLSContext interface.
 // It resolves the host via DoH, fetches ECH config, and establishes a TLS connection.
 func (dc *DialerWithCache) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
-		port = "443"
 	}
 
 	result, err := dc.resolver.Lookup(host, true)
