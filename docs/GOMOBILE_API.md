@@ -29,7 +29,7 @@ application's direct/network-user-proxy behavior.
 ```bash
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
-gomobile bind -target=android/arm64 -androidapi 29 \
+gomobile bind -target=android/arm64 -androidapi 27 \
   -o app/libs/echproxy.aar ./mobile/echproxy
 ```
 
