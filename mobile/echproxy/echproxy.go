@@ -6,8 +6,12 @@
 package echproxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -15,19 +19,37 @@ import (
 	"github.com/anglesgirl/ech-proxy-go/internal/proxy"
 )
 
+type boundedLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *boundedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, _ = l.b.Write(p)
+	if l.b.Len() > 64*1024 {
+		data := l.b.Bytes()
+		l.b.Reset()
+		_, _ = l.b.Write(data[len(data)-48*1024:])
+	}
+	return len(p), nil
+}
+
+func (l *boundedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 var (
 	mu       sync.Mutex
 	server   *proxy.Server
 	lastInfo = "not started"
+	logs     = &boundedLog{}
 )
 
 // Start launches a loopback-only HTTP CONNECT proxy.
-//
-// listen must be an address such as "127.0.0.1:34043". doh accepts one or more
-// comma-separated RFC 8484 DoH endpoints. cachePath may be empty, but Android
-// callers should provide an app-private file path to retain public ECH configs.
-// noDowngrade controls whether a host with ECH metadata may fall back to plain
-// TLS after ECH failure.
 func Start(listen, doh, cachePath string, noDowngrade bool) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -52,6 +74,8 @@ func Start(listen, doh, cachePath string, noDowngrade bool) error {
 		return err
 	}
 
+	logs = &boundedLog{}
+	log.SetOutput(io.MultiWriter(os.Stderr, logs))
 	s := proxy.New(cfg)
 	server = s
 	lastInfo = "starting on " + listen
@@ -81,7 +105,6 @@ func Stop() error {
 	if s == nil {
 		return nil
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err := s.Shutdown(ctx)
@@ -91,18 +114,24 @@ func Stop() error {
 	return err
 }
 
-// IsRunning reports whether this process currently owns a started proxy.
 func IsRunning() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return server != nil
 }
 
-// LastStatus returns lifecycle status. Detailed ECH acceptance is emitted by
-// the core tlsconn logger; applications should collect their bounded Go log
-// bridge when exposing diagnostics.
+// LastStatus returns the concise lifecycle status. Use Diagnostics for the
+// bounded protocol log.
 func LastStatus() string {
 	mu.Lock()
 	defer mu.Unlock()
 	return lastInfo
+}
+
+// Diagnostics returns lifecycle status plus the bounded Go proxy log.
+func Diagnostics() string {
+	mu.Lock()
+	info := lastInfo
+	mu.Unlock()
+	return info + "\n--- go proxy log ---\n" + logs.String()
 }
