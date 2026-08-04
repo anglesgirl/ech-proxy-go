@@ -1,177 +1,137 @@
 # ech-proxy-go
 
-通用 ECH (Encrypted Client Hello) 前置代理，用 Go 实现。
+通用 **ECH（Encrypted Client Hello）前置代理**，以 Go 实现 HTTP CONNECT 与 SOCKS5。它是客户端项目的共享 ECH 传输层：应用接入本仓库，而不是各自重新实现 DoH、HTTPS/SVCB、ECH TLS 与回退逻辑。
+
+> **集成新应用或让 AI 改 ECH 前，先读：**
+> - [`AGENTS.md`](AGENTS.md)：AI/贡献者硬性规则
+> - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：架构、边界与性能约束
+> - [`docs/ANDROID_INTEGRATION.md`](docs/ANDROID_INTEGRATION.md)：Android 实战集成清单
 
 ## 工作原理
 
-1. 监听本地端口，接受 HTTP CONNECT / SOCKS5 代理请求
-2. 通过 DoH 查询目标域名的 A/AAAA + HTTPS(type 65) 记录
-3. 从 HTTPS 记录中提取 ECHConfig（支持文本格式和 RFC 3597 线格式）
-4. 用 Go 1.23+ `crypto/tls` 原生 ECH 支持建立 TLS 连接
-5. 双向转发数据
+```text
+客户端（OkHttp / WebView / 播放器 / 下载器）
+  -> 本机 127.0.0.1 HTTP CONNECT 或 SOCKS5
+  -> DoH 查询 A / AAAA / HTTPS (SVCB, type 65)
+  -> 有 ECHConfigList 时用 ECH TLS；否则普通 TLS 或受策略控制的降级
+  -> 目标 HTTPS 服务
+```
+
+本机代理不解密 HTTPS 应用数据、也不是中间人；它只负责 DoH 解析及到上游的 TLS 建连。
 
 ## 特性
 
-- **HTTP CONNECT 代理** — 标准 HTTP 代理协议，任何 HTTP 客户端可用
-- **SOCKS5 代理** — 同时支持 SOCKS5 协议
-- **多 DoH 端点** — 逗号分隔多个 DoH URL，按顺序尝试，适合 GFW 环境
-- **DNS 缓存** — 带 TTL 的内存缓存 + 过期条目兜底
-- **ECH 配置文件缓存** — 5 小时 TTL 文件缓存，缓存优先（不查 DoH 直接握手）
-- **Cloudflare 官方 ECH 公钥** — 优先从 `cloudflare-ech.com` 获取，适用所有 CF 站点
-- **ECH 拒绝重试** — 服务器拒绝 ECH 时自动使用 `retry_configs` 重试并缓存该配置
-- **保护性降级** — ECH 全部失败后回退普通 TLS 保证连通（`no_downgrade` 可关闭）
-- **AS13335 IP 校验** — 自定义边缘 IP 只接受 Cloudflare AS13335 地址
-- **跨平台证书** — Android 扫描系统证书目录 (DER+PEM)；Windows/Linux/macOS 使用 OS 原生证书库
-- **配置文件** — YAML 配置文件，灵活可配
-- **优雅关闭** — Unix 支持 SIGINT/SIGTERM，Windows 支持 Ctrl+C
-- **跨平台** — 纯 Go 静态编译，支持 Linux/Android/macOS/Windows
+- **HTTP CONNECT 与 SOCKS5**：可供标准 HTTP 客户端使用。
+- **多 DoH 端点**：逗号分隔、顺序尝试，适配受限网络。
+- **RFC 8484 二进制 DoH**：`application/dns-message` POST；兼容 AliDNS `/dns-query`。
+- **A / AAAA / HTTPS / TXT**：解析 HTTPS/SVCB 的 `ech=` 及 RFC 3597 wire 格式。
+- **缓存**：内存 DNS 缓存、公共 ECHConfigList 文件缓存、失效内存缓存兜底。
+- **ECH 重试**：服务器提供 `retry_configs` 时重试并缓存。
+- **可控降级**：默认可普通 TLS 兜底保证连通；`no_downgrade` 可禁止泄露 SNI 的降级。
+- **候选 IP 与 AS13335 过滤**：支持经校验的 Cloudflare 边缘 IP。
+- **跨平台证书**：Android 扫描系统证书目录；桌面系统使用原生证书库。
+- **可观测性**：日志记录 DoH、ECH 配置来源及 `ECHAccepted=true/false`。
 
 ## 快速开始
 
-### 编译
+### 编译与运行
 
 ```bash
 go build -o ech-proxy ./cmd/ech-proxy
-```
-
-### 运行
-
-```bash
-# 使用默认配置
 ./ech-proxy
 
-# 指定端口和 DoH
-./ech-proxy 17171 https://1.1.1.1/dns-query
+# 指定端口与 DoH（多个端点以逗号分隔）
+./ech-proxy 17171 https://1.1.1.1/dns-query,https://cloudflare-dns.com/dns-query
 
 # 使用配置文件
 ./ech-proxy -config config.yaml
 ```
 
-### 作为 Android 应用前置代理
+### 使用客户端代理
 
 ```bash
-# 交叉编译 (静态二进制，Android 可直接运行)
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o ech-proxy-arm64 ./cmd/ech-proxy
-CGO_ENABLED=0 GOOS=linux GOARCH=arm   go build -ldflags="-s -w" -o ech-proxy-arm ./cmd/ech-proxy
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-amd64 ./cmd/ech-proxy
-```
-
-将二进制放入 Android 应用的 assets 目录，运行时提取到私有目录执行，设置 HTTP 代理指向 `127.0.0.1:17171`。
-
-### Windows 使用
-
-#### 方式一：下载预编译版本（推荐）
-
-1. 从 [GitHub Releases](../../releases) 下载 `ech-proxy-windows-x86_64.exe`
-2. 放到一个空文件夹，重命名为 `ech-proxy.exe`
-3. 同目录放置 `config.yaml`（可选，见下方配置文件说明）
-4. 双击 `start.bat` 启动，或命令行运行：
-
-```cmd
-ech-proxy.exe -config config.yaml
-```
-
-5. Ctrl+C 退出
-
-#### 方式二：自行编译
-
-```cmd
-go build -o ech-proxy.exe ./cmd/ech-proxy
-```
-
-#### 设置 Windows 系统代理
-
-以管理员身份打开 PowerShell：
-
-```powershell
-# 开启系统代理（指向 ECH Proxy）
-.\set-proxy.ps1
-
-# 关闭系统代理
-.\unset-proxy.ps1
-```
-
-或手动设置：`设置 → 网络和 Internet → 代理 → 手动设置代理`，地址填 `127.0.0.1`，端口填 `17171`。
-
-#### Windows 配置文件示例
-
-```yaml
-listen: "127.0.0.1:17171"
-doh: "https://1.1.1.1/dns-query"
-mode: "http"
-dns:
-  cache_path: "ech_config.json"   # 缓存文件放在 exe 同目录
-ech:
-  no_downgrade: false
-```
-
-> Windows 下证书验证自动使用系统证书库，无需额外配置。
-
-### 客户端配置
-
-```bash
-# curl
 curl -x http://127.0.0.1:17171 https://example.com
 
-# 环境变量
 export http_proxy=http://127.0.0.1:17171
 export https_proxy=http://127.0.0.1:17171
+```
 
-# OkHttp (Android)
+OkHttp：
+
+```kotlin
 val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", 17171))
 val client = OkHttpClient.Builder().proxy(proxy).build()
 ```
+
+Android 应用的完整生命周期、WebView/Coil/播放器覆盖、Cookie 与网络安全配置要求，见 [`docs/ANDROID_INTEGRATION.md`](docs/ANDROID_INTEGRATION.md)。
 
 ## 配置文件
 
 ```yaml
 listen: "127.0.0.1:17171"
-# 支持多个 DoH 端点，逗号分隔
 doh: "https://1.1.1.1/dns-query,https://cloudflare-dns.com/dns-query"
 mode: "http"           # http / socks5 / both
+
 tls:
   timeout: "15s"
-  fallback_plain: true  # ECH 失败回退普通 TLS
+  fallback_plain: true   # ECH 最终失败时是否允许普通 TLS
+
 dns:
   cache_ttl: "300s"
   prefer_ipv4: true
-  cache_path: "ech_config.json"       # ECH 配置文件缓存（可选，放同目录）
+  cache_path: "ech_config.json" # 公共 ECHConfigList 缓存，可选
+
 ech:
-  custom_ips: "104.20.8.2,104.20.9.2"  # 自定义 Cloudflare 边缘 IP
-  no_downgrade: false                    # 禁止降级到明文 TLS
+  custom_ips: ""        # 可选；仅接受经 AS13335 验证的 IP
+  no_downgrade: false    # true 时禁止 ECH 主机降级到普通 TLS
 ```
 
-### 环境变量覆盖
+`ech.no_downgrade: true` 适合必须避免 SNI 泄露的部署，但 ECH 配置失效时会牺牲连通性；这是产品策略选择，不应被代码意外改变。
 
-| 变量 | 说明 |
-|------|------|
-| `DOH_URL` | 覆盖 DoH 地址 |
-| `LISTEN_ADDR` | 覆盖监听地址 |
-| `ECH_CUSTOM_IPS` | 覆盖自定义边缘 IP |
+## DoH 兼容性提示
+
+`https://dns.alidns.com/dns-query` 只接受 RFC 8484 **二进制 POST**；如果使用 JSON 查询，AliDNS 的 JSON 端点是：
+
+```text
+https://dns.alidns.com/resolve
+```
+
+不要把 `/dns-query` 改成 JSON GET，否则会造成 DoH/远程 TXT 配置失败。
+
+## 验证
+
+```bash
+go test ./...
+go vet ./...
+```
+
+HTTP 200 仅证明请求可达，**不能证明 ECH 已协商成功**。必须在真实目标请求日志中确认：
+
+```text
+ECHAccepted=true
+```
+
+Android 集成还必须验证：冷启动不等待远程配置、主 OkHttp/图片/WebView/播放/更新客户端均已接线，以及代理不可用时仍能直连。
 
 ## 项目结构
 
-```
+```text
 ech-proxy-go/
-├── cmd/ech-proxy/          # 主入口
+├── AGENTS.md                    # AI 和贡献者不可违反的集成规则
+├── cmd/ech-proxy/               # CLI 入口
 ├── internal/
-│   ├── certutil/           # 跨平台证书加载 (Android 扫描 / Win/Linux/macOS 原生)
-│   ├── cloudflare/         # AS13335 IP 范围校验
-│   ├── config/             # 配置加载和校验
-│   ├── dns/                # DoH 查询 + DNS 缓存 + ECH 文件缓存
-│   ├── proxy/              # HTTP CONNECT + SOCKS5 代理
-│   └── tlsconn/            # ECH TLS 连接 (retry_configs + 多候选)
-├── configs/                # 示例配置
-├── start.bat               # Windows 便捷启动脚本
-├── set-proxy.ps1           # 设置 Windows 系统代理
-├── unset-proxy.ps1         # 取消 Windows 系统代理
-└── .github/workflows/      # CI 自动编译 (含 Windows)
+│   ├── certutil/                # 跨平台证书加载
+│   ├── cloudflare/              # AS13335 IP 校验
+│   ├── config/                  # YAML 配置
+│   ├── dns/                     # DoH、SVCB/TXT、缓存
+│   ├── proxy/                   # HTTP CONNECT + SOCKS5 + relay
+│   └── tlsconn/                 # ECH TLS、retry_configs、降级
+├── android-ui/                  # Compose 设置组件（可选）
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── ANDROID_INTEGRATION.md
+└── .github/workflows/           # 多平台构建与 Release
 ```
-
-## 依赖
-
-- Go 1.23+ (需要 `crypto/tls` ECH 支持)
-- gopkg.in/yaml.v3 (配置文件解析)
 
 ## 许可证
 
