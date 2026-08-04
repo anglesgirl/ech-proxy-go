@@ -3,6 +3,10 @@
 // Android applications should call this package for lifecycle only. DNS, ECH,
 // TLS retry/fallback, caching, and CONNECT handling remain in the internal
 // packages owned by this repository.
+//
+// Every exported function recovers panics: a panic inside a gomobile-bound Go
+// function aborts the whole Android process, which shows up as an endless
+// app restart loop. Recovering and recording the error keeps the app alive.
 package echproxy
 
 import (
@@ -12,6 +16,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -49,89 +54,133 @@ var (
 	logs     = &boundedLog{}
 )
 
-// Start launches a loopback-only HTTP CONNECT proxy.
-func Start(listen, doh, cachePath string, noDowngrade bool) error {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if server != nil {
-		return nil
-	}
-	if listen == "" {
-		return fmt.Errorf("listen address is required")
-	}
-	if doh == "" {
-		return fmt.Errorf("DoH endpoint is required")
-	}
-
-	cfg := config.Default()
-	cfg.Listen = listen
-	cfg.DoH = doh
-	cfg.Mode = "http"
-	cfg.DNS.CachePath = cachePath
-	cfg.ECH.NoDowngrade = noDowngrade
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-
-	logs = &boundedLog{}
-	log.SetOutput(io.MultiWriter(os.Stderr, logs))
-	s := proxy.New(cfg)
-	server = s
-	lastInfo = "starting on " + listen
-	go func() {
-		err := s.ListenAndServe()
-		mu.Lock()
-		defer mu.Unlock()
-		if server == s {
-			server = nil
-		}
-		if err != nil {
-			lastInfo = "stopped: " + err.Error()
-		} else {
-			lastInfo = "stopped"
+// safe runs fn and converts any panic into a recorded status + error, so a
+// gomobile JNI call never aborts the Android process.
+func safe(what string, fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprintf("%s panic: %v\n%s", what, r, debug.Stack())
+			mu.Lock()
+			lastInfo = msg
+			mu.Unlock()
+			log.Print(msg)
+			err = fmt.Errorf("%s: %v", what, r)
 		}
 	}()
-	lastInfo = "listening on " + listen
-	return nil
+	return fn()
+}
+
+// Start launches a loopback-only HTTP CONNECT proxy.
+func Start(listen, doh, cachePath string, noDowngrade bool) error {
+	return safe("Start", func() error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if server != nil {
+			return nil
+		}
+		if listen == "" {
+			return fmt.Errorf("listen address is required")
+		}
+		if doh == "" {
+			return fmt.Errorf("DoH endpoint is required")
+		}
+
+		cfg := config.Default()
+		cfg.Listen = listen
+		cfg.DoH = doh
+		cfg.Mode = "http"
+		cfg.DNS.CachePath = cachePath
+		cfg.ECH.NoDowngrade = noDowngrade
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+
+		logs = &boundedLog{}
+		log.SetOutput(io.MultiWriter(os.Stderr, logs))
+		s := proxy.New(cfg)
+		server = s
+		lastInfo = "starting on " + listen
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					msg := fmt.Sprintf("serve panic: %v\n%s", r, debug.Stack())
+					mu.Lock()
+					lastInfo = msg
+					mu.Unlock()
+					log.Print(msg)
+				}
+			}()
+			err := s.ListenAndServe()
+			mu.Lock()
+			defer mu.Unlock()
+			if server == s {
+				server = nil
+			}
+			if err != nil {
+				lastInfo = "stopped: " + err.Error()
+			} else {
+				lastInfo = "stopped"
+			}
+		}()
+		lastInfo = "listening on " + listen
+		return nil
+	})
 }
 
 // Stop gracefully shuts down the current proxy. It is safe to call repeatedly.
 func Stop() error {
-	mu.Lock()
-	s := server
-	server = nil
-	mu.Unlock()
-	if s == nil {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	err := s.Shutdown(ctx)
-	mu.Lock()
-	lastInfo = "stopped"
-	mu.Unlock()
-	return err
+	return safe("Stop", func() error {
+		mu.Lock()
+		s := server
+		server = nil
+		mu.Unlock()
+		if s == nil {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		err := s.Shutdown(ctx)
+		mu.Lock()
+		lastInfo = "stopped"
+		mu.Unlock()
+		return err
+	})
 }
 
+// IsRunning reports whether this process currently owns a started proxy.
 func IsRunning() bool {
-	mu.Lock()
-	defer mu.Unlock()
-	return server != nil
+	running := false
+	_ = safe("IsRunning", func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		running = server != nil
+		return nil
+	})
+	return running
 }
 
 // LastStatus returns the concise lifecycle status. Use Diagnostics for the
 // bounded protocol log.
 func LastStatus() string {
-	mu.Lock()
-	defer mu.Unlock()
-	return lastInfo
+	var info string
+	_ = safe("LastStatus", func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		info = lastInfo
+		return nil
+	})
+	return info
 }
 
 // Diagnostics returns lifecycle status plus the bounded Go proxy log.
 func Diagnostics() string {
-	mu.Lock()
-	info := lastInfo
-	mu.Unlock()
+	var info string
+	_ = safe("Diagnostics", func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		info = lastInfo
+		return nil
+	})
 	return info + "\n--- go proxy log ---\n" + logs.String()
 }
