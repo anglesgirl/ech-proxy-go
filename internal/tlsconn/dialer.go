@@ -80,7 +80,7 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 
 	tlsConfig := &tls.Config{
 		ServerName:         hostname,
-		MinVersion:         tls.VersionTLS13,
+		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: d.skipVerify,
 		NextProtos:         []string{"h2", "http/1.1"},
 	}
@@ -91,6 +91,8 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 	// Configure ECH if available.
 	hasECH := result.ECH != nil && len(result.ECH.Config) > 0
 	if hasECH {
+		// ECH 只在 TLS 1.3 中定义，故 ECH 连接必须强制 1.3。
+		tlsConfig.MinVersion = tls.VersionTLS13
 		tlsConfig.EncryptedClientHelloConfigList = result.ECH.Config
 		if result.OuterSNI != "" {
 			outerName := strings.TrimSuffix(result.OuterSNI, ".")
@@ -140,8 +142,9 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 	if hasECH && d.fallbackPlain {
 		log.Printf("[tls] all ECH attempts failed for %s, falling back to plain TLS", hostname)
 		plainConfig := &tls.Config{
-			ServerName:         hostname,
-			MinVersion:         tls.VersionTLS13,
+			ServerName: hostname,
+			// plain TLS 兼容老 CDN（只支持 TLS 1.2，如内容页静态资源源站）。
+			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: d.skipVerify,
 			NextProtos:         []string{"h2", "http/1.1"},
 		}
