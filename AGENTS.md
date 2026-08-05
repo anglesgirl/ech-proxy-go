@@ -51,9 +51,9 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 
 每个导出到 Android 的函数在入口用 `safe()` 包住，panic → 记录 + 返回错误，**绝不 abort 进程**（否则 Android 无限重启）。
 
-### 1.5 【关键】ECH 只支持 TLS 1.3；上游响应可能是 HTTP/2
+### 1.5 【关键】ECH 只支持 TLS 1.3；plain-TLS 目标放宽到 TLS 1.2
 
-- **ECH 握手连接必须强制 `MinVersion: tls.VersionTLS13`**（ECH 仅在 TLS 1.3 中定义）。`internal/tlsconn/dialer.go` 里 `tlsConfig.MinVersion` 不可降到 1.2。
+- **ECH 握手连接必须强制 `MinVersion: tls.VersionTLS13`**（ECH 仅在 TLS 1.3 中定义）。`internal/tlsconn/dialer.go`：仅当目标**有 ECH 配置**时才设 `MinVersion=TLS13`；**无 ECH（plain TLS）时用 `MinVersion=TLS12`**，以兼容内容页里只支持 TLS 1.2 的老 CDN/静态源站。ECH/plain 的切换由 `hasECH` 决定。
 - **ALPN 会协商成 `h2`**：应用层转发（`appLayerClient`）的 `http.Transport` **必须允许 HTTP/2**，禁止设 `ForceAttemptHTTP2: false`——否则服务器按 HTTP/2 发帧、Go 按 HTTP/1 解析 → `malformed HTTP response "\x00\x00\x12\x04..."`（SETTINGS 帧）。
 - CONNECT 隧道给 WebView/MPV 纯 TCP 转发时不涉及（客户端自己定协议）。
 
