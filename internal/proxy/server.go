@@ -121,6 +121,29 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.server.Shutdown(ctx)
 }
 
+// SetEndpoints hot-updates the DoH endpoints and custom edge IPs without
+// restarting the proxy. Called after the seed TXT config arrives.
+func (s *Server) SetEndpoints(doh, ip string) {
+	doh = strings.TrimSpace(doh)
+	ip = strings.TrimSpace(ip)
+	if doh != "" {
+		urls := make([]string, 0)
+		for _, u := range strings.Split(doh, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				urls = append(urls, u)
+			}
+		}
+		if len(urls) > 0 {
+			s.resolver.SetDoHURLs(urls)
+		}
+	}
+	if ip != "" {
+		s.dialer.SetCustomIPs(ip)
+		log.Printf("[proxy] custom edge IPs updated: %s", ip)
+	}
+}
+
 // handleHTTP handles HTTP requests: application-layer forwarding
 // (X-Ech-Target mode) and HTTP CONNECT tunnels.
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {

@@ -148,6 +148,20 @@ func Stop() error {
 	})
 }
 
+// SetEndpoints hot-updates the DoH endpoints and custom edge IPs from the
+// seed TXT config without restarting the proxy.
+func SetEndpoints(doh, ip string) error {
+	return safe("SetEndpoints", func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if server == nil {
+			return fmt.Errorf("proxy not started")
+		}
+		server.SetEndpoints(doh, ip)
+		return nil
+	})
+}
+
 // IsRunning reports whether this process currently owns a started proxy.
 func IsRunning() bool {
 	running := false

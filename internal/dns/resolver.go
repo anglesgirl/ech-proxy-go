@@ -130,6 +130,25 @@ func (r *Resolver) DoHURLs() []string {
 	return r.dohURLs
 }
 
+// SetDoHURLs hot-updates the DoH endpoint list (from seed TXT config).
+func (r *Resolver) SetDoHURLs(urls []string) {
+	var cleaned []string
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			cleaned = append(cleaned, u)
+		}
+	}
+	if len(cleaned) == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.dohURLs = cleaned
+	r.cache = make(map[string]*Result) // 换源后清缓存,避免脏结果
+	r.mu.Unlock()
+	log.Printf("[dns] DoH endpoints updated: %v", cleaned)
+}
+
 func (r *Resolver) sortIPv4First(ips []net.IP) {
 	for i := 0; i < len(ips); i++ {
 		if ips[i].To4() != nil {
