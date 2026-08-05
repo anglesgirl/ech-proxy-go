@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,10 @@ type Server struct {
 	resolver *dns.Resolver
 	dialer   *tlsconn.Dialer
 	server   *http.Server
+	// appLayerClient 处理应用层转发(X-Ech-Target 模式):OkHttp 发来明文
+	// HTTP 请求 + X-Ech-Target 头,代理用 ECH 连上游、返回明文响应。
+	// 与 CONNECT 隧道不同:客户端不需要自己再 TLS 握手。
+	appLayerClient *http.Client
 }
 
 // New creates a proxy server from configuration.
@@ -68,6 +73,21 @@ func New(cfg *config.Config) *Server {
 		dialer:   dialer,
 	}
 
+	// 应用层转发:用 DialerWithCache 作为 DialTLSContext,
+	// http.Client 的每个请求都会经 DoH + ECH(或普通 TLS) 连上游。
+	appLayerDialer := tlsconn.NewWithCache(dialer, resolver)
+	srv.appLayerClient = &http.Client{
+		Transport: &http.Transport{
+			DialTLSContext:    appLayerDialer.DialContext,
+			ForceAttemptHTTP2: false,
+			Proxy:             nil,
+		},
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
 	srv.server = &http.Server{
 		Addr:         cfg.Listen,
 		Handler:      http.HandlerFunc(srv.handleHTTP),
@@ -101,8 +121,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.server.Shutdown(ctx)
 }
 
-// handleHTTP handles HTTP CONNECT requests.
+// handleHTTP handles HTTP requests: application-layer forwarding
+// (X-Ech-Target mode) and HTTP CONNECT tunnels.
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// Application-layer forwarding: OkHttp (via EchInterceptor) rewrites
+	// https://host/path -> http://127.0.0.1:port/path + "X-Ech-Target: host".
+	// The proxy completes ECH/plain-TLS itself and returns cleartext HTTP,
+	// so the client never re-handshakes TLS on top (avoiding double TLS).
+	if r.Method != http.MethodConnect {
+		s.handleAppLayer(w, r)
+		return
+	}
+
 	host, port, err := net.SplitHostPort(r.Host)
 	if err != nil {
 		host = r.Host
@@ -111,18 +141,9 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[http] CONNECT %s:%s", host, port)
 
-	if port != "443" {
-		s.handlePlainForward(w, r, host, port)
-		return
-	}
-
-	result, err := s.resolver.Lookup(host, s.cfg.DNS.PreferIPv4)
-	if err != nil {
-		log.Printf("[http] DoH failed for %s: %v", host, err)
-		http.Error(w, "DNS lookup failed", http.StatusBadGateway)
-		return
-	}
-
+	// CONNECT 隧道语义:纯 TCP 转发,客户端(WebView/MPV/系统代理)自己在
+	// 隧道内做 TLS。绝不能在这里用 DialECH 返回已握手的 TLS 连接——
+	// 客户端再握一次会双重加密。ECH 只由应用层(X-Ech-Target)完成。
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
@@ -137,16 +158,97 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	targetConn, err := s.dialer.DialECH(host, result)
+	targetConn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
 	if err != nil {
-		log.Printf("[http] ECH dial failed for %s: %v", host, err)
+		log.Printf("[http] tcp dial %s: %v", host, err)
 		return
 	}
 	defer targetConn.Close()
 
-	log.Printf("[http] connected %s (%s) ech=%v", host, result.IPs[0], result.ECH != nil)
-
 	Relay(clientConn, targetConn)
+}
+
+// handleAppLayer proxies a cleartext HTTP request whose target host is carried
+// in the X-Ech-Target header. It forwards the request to the upstream over an
+// ECH (or plain TLS) connection and writes the upstream response back verbatim.
+func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
+	target := strings.TrimSpace(r.Header.Get("X-Ech-Target"))
+	if target == "" {
+		// No target and not CONNECT: not something we proxy.
+		http.Error(w, "missing X-Ech-Target", http.StatusBadRequest)
+		return
+	}
+	if !validHost(target) {
+		http.Error(w, "echproxy: invalid target host", http.StatusBadRequest)
+		return
+	}
+	target = strings.ToLower(target)
+
+	outURL := &url.URL{Scheme: "https", Host: target, Path: r.URL.Path, RawQuery: r.URL.RawQuery}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "echproxy: bad request: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	for k, vv := range r.Header {
+		if hopByHopHeader(k) || k == "Host" || k == "X-Ech-Target" {
+			continue
+		}
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Host = target
+	req.Header.Del("Accept-Encoding")
+
+	resp, err := s.appLayerClient.Do(req)
+	if err != nil {
+		log.Printf("[http] app-layer upstream error %s %s: %v", r.Method, r.URL.Path, err)
+		http.Error(w, "echproxy: upstream error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Printf("[http] app-layer %s %s -> %s", target, r.URL.Path, resp.Status)
+
+	if loc := resp.Header.Get("Location"); loc != "" {
+		resp.Header.Set("Location", rewriteLocation(loc, target))
+	}
+	for k, vv := range resp.Header {
+		if hopByHopHeader(k) {
+			continue
+		}
+		if resp.Uncompressed && (k == "Content-Encoding" || k == "Content-Length") {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// hopByHopHeader reports whether a header is restricted to a single hop.
+func hopByHopHeader(k string) bool {
+	switch http.CanonicalHeaderKey(k) {
+	case "Connection", "Proxy-Connection", "Keep-Alive",
+		"Proxy-Authenticate", "Proxy-Authorization",
+		"Te", "Trailer", "Transfer-Encoding", "Upgrade":
+		return true
+	}
+	return false
+}
+
+// rewriteLocation maps an upstream absolute/relative Location back to a URL
+// the app can follow through the same proxy.
+func rewriteLocation(loc, target string) string {
+	u, err := url.Parse(loc)
+	if err != nil || !u.IsAbs() {
+		return loc
+	}
+	u.Host = target
+	return u.String()
 }
 
 // handlePlainForward handles non-HTTPS TCP forwarding.
@@ -310,4 +412,23 @@ func parseInt(s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// validHost accepts lowercase DNS host names only (no ports/paths/IPs/special
+// chars). It mirrors the old upstream validation to keep per-host routing safe.
+func validHost(value string) bool {
+	if value == "" || len(value) > 253 || net.ParseIP(value) != nil || strings.ContainsAny(value, "/:@?#\\") {
+		return false
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(value, "."), ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r == '-' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+				return false
+			}
+		}
+	}
+	return true
 }
