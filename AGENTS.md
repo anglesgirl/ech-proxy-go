@@ -32,11 +32,12 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 
 **为什么不能用 CONNECT 隧道接入 OkHttp**：CONNECT 无法隐藏 SNI，GFW 会重置 javchu.com 等封锁站点。所以 Android 侧的 `HProxySelector.select()` 在 ECH 开启时**必须返回 `Proxy.NO_PROXY`**，让改写后的请求直连本机代理，绝不进入 CONNECT 隧道。
 
-### 1.3 【关键】DNS 解析：种子走 TXT，别名 DoH 列表，不用单一固定源
+### 1.3 【关键】DNS 解析：种子走 IP-DoH TXT，别名 DoH 列表
 
-- **种子（bootstrap）**：从 `ech-config.anglesgirl.eu.org` 的 **TXT 记录** 拉配置（`doh=`/`doh2=`/`doh3=`/`ip=`），用返回的 DoH 端点和自定义边缘 IP 启动/热更新代理。
+- **种子（bootstrap）必须用 IP 直连格式的 DoH**（如 `https://223.5.5.5/resolve`、`https://223.6.6.6/resolve`，alidns 的 IP），**禁止用域名形式的 DoH 端点做种子查询**——部分网络会劫持 DoH 域名的解析（劫持后返回的 TXT 全是伪造的）。
+- 从 `ech-config.anglesgirl.eu.org` 的 **TXT 记录** 拉配置（`doh=`/`doh2=`/`doh3=`/`ip=`），用返回的 DoH 端点和自定义边缘 IP 启动/热更新代理。
 - TXT 里的 `doh=` 是 **cloudflare-gateway**（大陆可能被墙）。
-- **严禁用单一固定 alidns 解析目标站点**：alidns 对部分域名（如 hanime1.me）会返回被污染的 Facebook 段 IP（`31.13.84.x`/`31.13.90.x`），并导致 `no ECHConfig ... plain TLS` 假象。必须多 DoH 交叉或走种子下发的 DoH。
+- **注意：IP 直连只防端点劫持，不解决目标域名本身的污染**（alidns 对 hanime1.me 返回 Facebook 段假 IP `31.13.84.x`/`128.242.240.221`，导致假 `no ECHConfig ... plain TLS`）。目标域名解析靠 TXT 下发的 DoH（cloudflare-gateway 等，不经劫持链路）。
 - alidns JSON 端点是 `/resolve`；`/dns-query` 只支持 RFC 8484 二进制 POST。
 - DoH 查询必须显式 `NO_PROXY`（否则 ECH 开启时系统代理指向本机代理 → 递归）。
 
