@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -249,7 +250,35 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
+
+	// HLS 播放列表必须重写:把相对/绝对路径引用改成基于原始域名(target)
+	// 的绝对 URL。否则播放器会按 127.0.0.1:<port>/... 解析分片路径,
+	// 丢失上游 host(X-Ech-Target),请求直接打到本机代理却无 target → 404。
+	// 仅当响应体确实是 m3u8 时才重写;ts/mp4 等二进制分片原样透传。
+	if isM3U8Response(resp) {
+		body, err := io.ReadAll(resp.Body)
+		if err == nil {
+			rewritten := rewriteM3U8(body, target, r.URL.Path)
+			if !bytes.Equal(rewritten, body) {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(rewritten)))
+				log.Printf("[http] app-layer m3u8 rewritten for %s%s (%d -> %d bytes)", target, r.URL.Path, len(body), len(rewritten))
+			}
+			_, _ = w.Write(rewritten)
+			return
+		}
+	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// isM3U8Response reports whether an upstream response carries an HLS playlist:
+// either an explicit mpegurl Content-Type or a .m3u8 URL suffix.
+func isM3U8Response(resp *http.Response) bool {
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "mpegurl") || strings.Contains(ct, "vnd.apple.mpegurl") {
+		return true
+	}
+	u := resp.Request.URL
+	return u != nil && strings.HasSuffix(strings.ToLower(u.Path), ".m3u8")
 }
 
 // hopByHopHeader reports whether a header is restricted to a single hop.
