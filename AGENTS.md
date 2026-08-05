@@ -32,20 +32,52 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 
 **为什么不能用 CONNECT 隧道接入 OkHttp**：CONNECT 无法隐藏 SNI，GFW 会重置 javchu.com 等封锁站点。所以 Android 侧的 `HProxySelector.select()` 在 ECH 开启时**必须返回 `Proxy.NO_PROXY`**，让改写后的请求直连本机代理，绝不进入 CONNECT 隧道。
 
-### 1.3 【关键】DNS 解析：多种子 IP-DoH TXT，别名 DoH 列表
+### 1.3 【铁律】种子协议：种子只用 IP-DoH，只做 TXT 获取，绝不参与主站解析
 
-- **种子（bootstrap）必须用 IP 直连格式的 DoH，且必须配置多个种子**——单一种子一旦失效/被劫持，App 就没网。**禁止用单一 DoH 端点做种子**。
-- 种子候选（按顺序尝试，全部失败才降级）：
-  - `https://223.5.5.5/resolve`（阿里 alidns，IP 直连，JSON）
-  - `https://101.226.4.6/resolve`（360，IP 直连，JSON）
-  - `https://doh.pub/resolve`（腾讯 DNSPod，域名兜底）
-  - （备用：`https://223.6.6.6/resolve` 阿里备用 IP）
-- 从 `ech-config.anglesgirl.eu.org` 的 **TXT 记录** 拉配置（`doh=`/`doh2=`/`doh3=`/`ip=`），用返回的 DoH 端点和自定义边缘 IP 启动/热更新代理。
-- **禁止用域名形式的 DoH 端点做种子主查询**——部分网络会劫持 DoH 域名的解析（劫持后返回的 TXT 全是伪造的）。IP 直连跳过 DoH 域名解析环节。
-- TXT 里的 `doh=` 是 **cloudflare-gateway**（大陆可能被墙）。
-- **注意：IP 直连只防端点劫持，不解决目标域名本身的污染**（alidns 对 hanime1.me 曾返回 Facebook 段假 IP `31.13.84.x`/`128.242.240.221`，导致假 `no ECHConfig ... plain TLS`）。hanime1.me 实际在 Cloudflare 上（A 记录 `104.26.x.x`/`172.67.x.x`），其 ECH 能力以干净 DoH（cloudflare-gateway 链）解析为准。目标域名解析靠 TXT 下发的 DoH（cloudflare-gateway 等，不经劫持链路）。
-- alidns/360 JSON 端点是 `/resolve`；`/dns-query` 只支持 RFC 8484 二进制 POST。
-- DoH 查询必须显式 `NO_PROXY`（否则 ECH 开启时系统代理指向本机代理 → 递归）。
+**这是整套 ECH 能工作的根基。违反任何一条都会立刻被污染、连不上，必须整体遵守，不可"临时兜底"偏航。**
+
+#### 1.3.1 种子定义（三件事，无第四件）
+
+种子的**唯一职责**是从 `ech-config.anglesgirl.eu.org` 的 **TXT 记录**拉取配置：
+`doh=` / `doh2=` / `doh3=` / `ip=`（ip 为优选边缘 IP）。除此之外**什么都不做**。
+
+三个铁律：
+1. **种子只用 IP 直连格式的 DoH**。候选列表（全部必须是 `https://<IP>/resolve`，禁止任何域名形式）：
+   ```
+   https://223.5.5.5/resolve     阿里 alidns  IP
+   https://101.226.4.6/resolve   360         IP
+   https://120.53.53.53/resolve  腾讯 DNSPod IP
+   https://223.6.6.6/resolve     阿里备用    IP
+   ```
+   **禁止 `doh.pub`、`dns.alidns.com`、`cloudflare-dns.com` 等域名做种子**——域名解析环节可被劫持（劫持后返回的 TXT 全是伪造的）。IP 直连跳过该环节，从源头防劫持。
+2. **种子只做 TXT 获取**。它查完 TXT、把配置交给代理后，**任务即结束**。种子的 IP-DoH **绝不用于解析主站/CDN/IP**（那些属于污染源）。
+3. **主站与目标 IP 的解析一律用 TXT 下发的 DoH**（即 `doh=`/`doh2=`/`doh3=`，通常是 cloudflare-gateway 链）。不用 TXT 下发的 DoH、回头用 alidns/doh.pub/任何种子去解析主站 = **立即污染**。
+
+#### 1.3.2 启动顺序（铁律，不可"先启动再补丁"）
+
+```
+1. 启动 APP
+2. 等待 ECH 代理启动窗口
+3. ECH 从种子（纯 IP-DoH）获取配置（TXT）→ 拿到 doh/doh2/doh3/ip
+4. 缓存配置（优选 IP 等）供下次冷启动直接使用
+5. 用 TXT 下发的 DoH 启动/接受 App 连接
+```
+
+**严禁**：先拿 alidns/默认 DoH 启动、再后台热更新换掉。首请求发生在那之前 = 首请求走污染源 = 假 `no ECHConfig` / 假 IP / 超时（本次日志 `starting ... doh=https://dns.alidns.com/resolve` 即此错误）。
+
+#### 1.3.3 兜底策略（fail-closed，绝不死回污染源）
+
+- 种子成功 → 用 TXT 配置启动。
+- 种子全失败 → 用**上次缓存的优选 IP / DoH**（缓存即是上次成功的 TXT 结果）启动。
+- 种子失败且无缓存 → **断网（不启动 ECH）**，日志提示用户重启 App 重试。
+- **任何情况下都不允许退回 `dns.alidns.com` / `doh.pub` 等域名 DoH 兜底**——那等于自杀式污染。
+
+#### 1.3.4 技术要点
+
+- DoH 查询必须显式 `Proxy.NO_PROXY`（ECH 开启时系统代理指向本机代理 → 否则递归）。
+- alidns/360/腾讯 IP 的 JSON 端点是 `/resolve`；`/dns-query` 只支持 RFC 8484 二进制 POST。
+- TXT 的 `doh=` 通常是 **cloudflare-gateway**（大陆可能被墙）。
+- IP 直连种子只防**端点劫持**；目标域名本身的污染（如 alidns 曾给 hanime1.me 返回 Facebook 段假 IP `31.13.84.x`）靠 **TXT 下发的 DoH** 解析规避。
 
 ### 1.4 【安全】gomobile 导出函数全部 `recover`
 
@@ -74,6 +106,7 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 | 日志 `no ECHConfig for host, plain TLS` 但该 host 其实支持 ECH | 解析被污染（违反 1.3），核对 IP 是否 Facebook 段 |
 | 直连真实 IP 超时 / Connection reset | 请求没走 ECH（拦截器未生效 / select 返回了代理），或该 host 本身不支持 ECH 且被墙 |
 | App 无限重启 | gomobile panic 未 recover（违反 1.4），或 firebase-perf 占位 API key |
+| 日志 `starting ... doh=https://dns.alidns.com/resolve` | 启动兜底用了污染源（违反 1.3.2/1.3.3），首请求被污染 |
 | Go 日志 `connected ... ech=true` 但 App 仍失败 | 接入模型用错（CONNECT 而非应用层），见 1.2 |
 
 ---
