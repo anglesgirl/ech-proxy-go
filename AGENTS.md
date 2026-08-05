@@ -43,7 +43,7 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 - 从 `ech-config.anglesgirl.eu.org` 的 **TXT 记录** 拉配置（`doh=`/`doh2=`/`doh3=`/`ip=`），用返回的 DoH 端点和自定义边缘 IP 启动/热更新代理。
 - **禁止用域名形式的 DoH 端点做种子主查询**——部分网络会劫持 DoH 域名的解析（劫持后返回的 TXT 全是伪造的）。IP 直连跳过 DoH 域名解析环节。
 - TXT 里的 `doh=` 是 **cloudflare-gateway**（大陆可能被墙）。
-- **注意：IP 直连只防端点劫持，不解决目标域名本身的污染**（alidns 对 hanime1.me 返回 Facebook 段假 IP `31.13.84.x`/`128.242.240.221`，导致假 `no ECHConfig ... plain TLS`）。目标域名解析靠 TXT 下发的 DoH（cloudflare-gateway 等，不经劫持链路）。
+- **注意：IP 直连只防端点劫持，不解决目标域名本身的污染**（alidns 对 hanime1.me 曾返回 Facebook 段假 IP `31.13.84.x`/`128.242.240.221`，导致假 `no ECHConfig ... plain TLS`）。hanime1.me 实际在 Cloudflare 上（A 记录 `104.26.x.x`/`172.67.x.x`），其 ECH 能力以干净 DoH（cloudflare-gateway 链）解析为准。目标域名解析靠 TXT 下发的 DoH（cloudflare-gateway 等，不经劫持链路）。
 - alidns/360 JSON 端点是 `/resolve`；`/dns-query` 只支持 RFC 8484 二进制 POST。
 - DoH 查询必须显式 `NO_PROXY`（否则 ECH 开启时系统代理指向本机代理 → 递归）。
 

@@ -78,9 +78,8 @@ func New(cfg *config.Config) *Server {
 	appLayerDialer := tlsconn.NewWithCache(dialer, resolver)
 	srv.appLayerClient = &http.Client{
 		Transport: &http.Transport{
-			DialTLSContext:    appLayerDialer.DialContext,
-			ForceAttemptHTTP2: false,
-			Proxy:             nil,
+			DialTLSContext: appLayerDialer.DialContext,
+			Proxy:          nil,
 		},
 		Timeout: 60 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
