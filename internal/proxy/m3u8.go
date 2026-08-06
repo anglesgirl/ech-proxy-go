@@ -8,15 +8,17 @@ import (
 )
 
 // rewriteM3U8 converts every relative/absolute reference inside an HLS master
-// or media playlist into an absolute https:// URL based on the original target
-// host (the X-Ech-Target). Without this, a playlist served through the proxy
-// would contain relative segment paths (e.g. "seg-1.ts") that the player
-// resolves against the proxy URL (http://127.0.0.1:port/...), losing the
-// upstream host and 404ing.
+// or media playlist into an absolute URL. Two output modes:
+//
+//   - proxyBase == "" → "https://<target>/<path>" (absolute upstream URL; the
+//     player re-enters the proxy through its own interceptor).
+//   - proxyBase != "" → "<proxyBase>/<target>/<path>" (path-prefix proxy URL;
+//     used so players that cannot send custom headers — e.g. Android system
+//     MediaPlayer — still route every segment through the ECH proxy).
 //
 // Lines that are not references (directives starting with '#', blank lines,
 // comments, already-absolute http(s) URLs) are left untouched.
-func rewriteM3U8(body []byte, target string, reqPath string) []byte {
+func rewriteM3U8(body []byte, target string, reqPath string, proxyBase string) []byte {
 	if !isM3U8(body) {
 		return body
 	}
@@ -33,21 +35,20 @@ func rewriteM3U8(body []byte, target string, reqPath string) []byte {
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		// Already absolute http(s) URL: leave untouched. (The player will
-		// request it through OkHttp/EchInterceptor, so it still goes via ECH.)
+		// Already absolute http(s) URL: leave untouched.
 		if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
 			continue
 		}
-		abs := resolveReference(target, baseDir, trimmed)
+		abs := resolveReference(target, baseDir, trimmed, proxyBase)
 		lines[i] = []byte(abs)
 	}
 	return bytes.Join(lines, []byte("\n"))
 }
 
-// resolveReference builds "https://<target><resolvedPath>" for a playlist
-// reference. Handles absolute-path references ("/hls/seg.ts") and relative
-// references ("seg.ts", "../seg.ts", "sub/seg.ts").
-func resolveReference(target, baseDir, ref string) string {
+// resolveReference builds an absolute URL for a playlist reference. Handles
+// absolute-path references ("/hls/seg.ts") and relative references
+// ("seg.ts", "../seg.ts", "sub/seg.ts").
+func resolveReference(target, baseDir, ref string, proxyBase string) string {
 	u := &url.URL{Scheme: "https", Host: target}
 	if strings.HasPrefix(ref, "/") {
 		u.Path = ref
@@ -63,7 +64,21 @@ func resolveReference(target, baseDir, ref string) string {
 			u.Fragment = rest[1:]
 		}
 	}
+	if proxyBase != "" {
+		// path-prefix 模式：http://127.0.0.1:<port>/<target>/<path>
+		return proxyBase + "/" + target + u.Path + querySuffix(u)
+	}
 	return u.String()
+}
+
+func querySuffix(u *url.URL) string {
+	if u.RawQuery != "" {
+		return "?" + u.RawQuery
+	}
+	if u.Fragment != "" {
+		return "#" + u.Fragment
+	}
+	return ""
 }
 
 // isM3U8 reports whether the body looks like an HLS playlist, regardless of

@@ -197,6 +197,23 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // ECH (or plain TLS) connection and writes the upstream response back verbatim.
 func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 	target := strings.TrimSpace(r.Header.Get("X-Ech-Target"))
+	reqPath := r.URL.Path
+	if target == "" {
+		// 2026-08-06: path-prefix 模式——系统 MediaPlayer 的分片请求不携带自定义
+		// header（MediaPlayer 内部 HLS 播放器发起），只能把 target 编码进 URL：
+		//   http://127.0.0.1:<port>/<target-host>/<path>
+		// 从路径第一段解析 target，剩余部分作为上游路径。
+		if strings.HasPrefix(reqPath, "/") {
+			rest := strings.TrimPrefix(reqPath, "/")
+			if idx := strings.IndexByte(rest, '/'); idx > 0 {
+				candidate := rest[:idx]
+				if validHost(candidate) {
+					target = candidate
+					reqPath = rest[idx:]
+				}
+			}
+		}
+	}
 	if target == "" {
 		// No target and not CONNECT: not something we proxy.
 		http.Error(w, "missing X-Ech-Target", http.StatusBadRequest)
@@ -208,7 +225,7 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 	}
 	target = strings.ToLower(target)
 
-	outURL := &url.URL{Scheme: "https", Host: target, Path: r.URL.Path, RawQuery: r.URL.RawQuery}
+	outURL := &url.URL{Scheme: "https", Host: target, Path: reqPath, RawQuery: r.URL.RawQuery}
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "echproxy: bad request: "+err.Error(), http.StatusBadGateway)
@@ -252,7 +269,11 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 	var rewrittenBody []byte
 	if isM3U8Response(resp) {
 		if body, err := io.ReadAll(resp.Body); err == nil {
-			rewrittenBody = rewriteM3U8(body, target, r.URL.Path)
+			// 2026-08-06: 分片重写为 path-prefix 代理 URL（http://127.0.0.1:<port>/<target>/<path>），
+			// 让系统 MediaPlayer（分片请求不带自定义 header）也能走 ECH 代理。
+			// ExoPlayer/MPV 拿到该 URL 同样走代理（EchInterceptor 放行 127.0.0.1 直连本地代理 → path-prefix 识别 target）。
+			proxyBase := "http://127.0.0.1" + s.cfg.Listen[strings.LastIndex(s.cfg.Listen, ":"):]
+			rewrittenBody = rewriteM3U8(body, target, r.URL.Path, proxyBase)
 			if !bytes.Equal(rewrittenBody, body) {
 				log.Printf("[http] app-layer m3u8 rewritten for %s%s (%d -> %d bytes)", target, r.URL.Path, len(body), len(rewrittenBody))
 			}
