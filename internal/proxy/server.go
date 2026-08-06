@@ -196,25 +196,8 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // in the X-Ech-Target header. It forwards the request to the upstream over an
 // ECH (or plain TLS) connection and writes the upstream response back verbatim.
 func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
-	target := strings.TrimSpace(r.Header.Get("X-Ech-Target"))
-	reqPath := r.URL.Path
-	if target == "" {
-		// 2026-08-06: path-prefix 模式——系统 MediaPlayer 的分片请求不携带自定义
-		// header（MediaPlayer 内部 HLS 播放器发起），只能把 target 编码进 URL：
-		//   http://127.0.0.1:<port>/<target-host>/<path>
-		// 从路径第一段解析 target，剩余部分作为上游路径。
-		if strings.HasPrefix(reqPath, "/") {
-			rest := strings.TrimPrefix(reqPath, "/")
-			if idx := strings.IndexByte(rest, '/'); idx > 0 {
-				candidate := rest[:idx]
-				if validHost(candidate) {
-					target = candidate
-					reqPath = rest[idx:]
-				}
-			}
-		}
-	}
-	if target == "" {
+	target, reqPath, ok := resolveTarget(strings.TrimSpace(r.Header.Get("X-Ech-Target")), r.URL.Path)
+	if !ok {
 		// No target and not CONNECT: not something we proxy.
 		http.Error(w, "missing X-Ech-Target", http.StatusBadRequest)
 		return
@@ -302,6 +285,42 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// resolveTarget determines the upstream host for an app-layer request.
+// Returns (target, path, ok). Two modes:
+//
+//   - X-Ech-Target header (ExoPlayer/MPV initial request): target from header;
+//     if the path also carries the path-prefix form (/<target>/<path>) — MPV's
+//     global http-header-fields sends the header on EVERY request including
+//     path-prefix segment URLs — strip the duplicated prefix so the upstream
+//     request is https://<target>/<path>, not https://<target>/<target>/<path>.
+//   - path-prefix only (segment requests from players that can't send headers):
+//     target = first path segment (must look like a hostname, i.e. contain a
+//     dot), path = remainder.
+func resolveTarget(headerTarget, path string) (string, string, bool) {
+	target := strings.TrimSpace(headerTarget)
+	if target != "" {
+		// Path-prefix URL with header also present: /<target>/<path> -> strip.
+		prefix := "/" + strings.ToLower(target) + "/"
+		if strings.HasPrefix(strings.ToLower(path), prefix) {
+			path = path[len(prefix)-1:] // keep leading "/"
+		}
+		return target, path, true
+	}
+	// No header: try path-prefix form.
+	if strings.HasPrefix(path, "/") {
+		rest := strings.TrimPrefix(path, "/")
+		if idx := strings.IndexByte(rest, '/'); idx > 0 {
+			candidate := rest[:idx]
+			// Require a dot: distinguishes a hostname from a normal path segment
+			// like /watch/... or /video/... which are not path-prefix targets.
+			if strings.Contains(candidate, ".") && validHost(candidate) {
+				return strings.ToLower(candidate), rest[idx:], true
+			}
+		}
+	}
+	return "", "", false
 }
 
 // isM3U8Response reports whether an upstream response carries an HLS playlist:
