@@ -89,7 +89,17 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 - **ALPN 会协商成 `h2`**：应用层转发（`appLayerClient`）的 `http.Transport` **必须允许 HTTP/2**，禁止设 `ForceAttemptHTTP2: false`——否则服务器按 HTTP/2 发帧、Go 按 HTTP/1 解析 → `malformed HTTP response "\x00\x00\x12\x04..."`（SETTINGS 帧）。
 - CONNECT 隧道给 WebView/MPV 纯 TCP 转发时不涉及（客户端自己定协议）。
 
-### 1.6 崩溃 / 日志
+### 1.6 【限流】CF 429：固定 CustomIPs 是最大嫌疑（2026-08-06 实测）
+
+- 症状：App 日志 `[ECH] ← 429 127.0.0.1/`（429 来自代理转发后的 CF 上游），首次连接慢，页面/视频加载失败。
+- 根因：种子 TXT 里写死 `ip=8.39.125.114,162.159.16.28` → 所有请求固定走两个**共享 CF 边缘 IP** → 被 Cloudflare 限流（429）。
+- 修复（两级，DNS 层优先）：
+  1. **删掉种子 TXT 里的 `ip=` 记录**（CF API `DELETE /zones/{zone}/dns_records/{id}`）→ 代理改用 DoH 实时解析的 IP 列表轮换连接。
+  2. **扩充 DoH 端点**：Zero Trust API `GET /accounts/{acct}/gateway/locations` 列出全部 location 的 `doh_subdomain`，把多个端点逗号分隔写进 TXT 的 `doh=`/`doh2=`/`doh3=`——Go 侧 `parseDoHList` 原生支持逗号分隔逐个尝试，一个被墙/限流自动换下一个。
+- 验证：`curl "https://<doh>/dns-query?name=X&type=A" -H "Accept: application/dns-json"` 应 200。
+- 另：种子列表里 alidns（223.5.5.5/223.6.6.6）在国内频繁超时/抖动，疑似 429 相关，**已从种子列表移除**（2026-08-06），保留 360 / DNSPod / 腾讯备用。
+
+### 1.7 崩溃 / 日志
 
 - Android 端 `DiagnosticsLog` 持久化事件日志 + 崩溃自动写 Downloads（`Han1meViewer-crash-*.txt`）。
 - Go 端 `Diagnostics()` 返回生命周期状态 + 有界日志（DNS 源 / ECH accept-reject / 降级 / 路由 / 上游错误）。
@@ -108,6 +118,7 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 | App 无限重启 | gomobile panic 未 recover（违反 1.4），或 firebase-perf 占位 API key |
 | 日志 `starting ... doh=https://dns.alidns.com/resolve` | 启动兜底用了污染源（违反 1.3.2/1.3.3），首请求被污染 |
 | Go 日志 `connected ... ech=true` 但 App 仍失败 | 接入模型用错（CONNECT 而非应用层），见 1.2 |
+| App 日志 `[ECH] ← 429 127.0.0.1/` | 上游 CF 限流：种子 TXT 里固定 `ip=` 是共享 IP（见 1.6），删 ip= 并扩充 DoH 端点 |
 
 ---
 
