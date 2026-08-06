@@ -44,11 +44,11 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 三个铁律：
 1. **种子只用 IP 直连格式的 DoH**。候选列表（全部必须是 `https://<IP>/resolve`，禁止任何域名形式）：
    ```
-   https://223.5.5.5/resolve     阿里 alidns  IP
-   https://101.226.4.6/resolve   360         IP
+   https://101.226.4.6/resolve   360         IP（首选）
    https://120.53.53.53/resolve  腾讯 DNSPod IP
-   https://223.6.6.6/resolve     阿里备用    IP
+   https://1.12.12.12/resolve    腾讯备用    IP
    ```
+   **2026-08-06：移除 alidns（223.5.5.5/223.6.6.6）**——国内频繁超时/抖动，疑似与 429 限流相关。
    **禁止 `doh.pub`、`dns.alidns.com`、`cloudflare-dns.com` 等域名做种子**——域名解析环节可被劫持（劫持后返回的 TXT 全是伪造的）。IP 直连跳过该环节，从源头防劫持。
 2. **种子只做 TXT 获取**。它查完 TXT、把配置交给代理后，**任务即结束**。种子的 IP-DoH **绝不用于解析主站/CDN/IP**（那些属于污染源）。
 3. **主站与目标 IP 的解析一律用 TXT 下发的 DoH**（即 `doh=`/`doh2=`/`doh3=`，通常是 cloudflare-gateway 链）。不用 TXT 下发的 DoH、回头用 alidns/doh.pub/任何种子去解析主站 = **立即污染**。
