@@ -238,6 +238,27 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 	if loc := resp.Header.Get("Location"); loc != "" {
 		resp.Header.Set("Location", rewriteLocation(loc, target))
 	}
+
+	// HLS 播放列表必须重写:把相对/绝对路径引用改成基于原始域名(target)
+	// 的绝对 URL。否则播放器会按 127.0.0.1:<port>/... 解析分片路径,
+	// 丢失上游 host(X-Ech-Target),请求直接打到本机代理却无 target → 404。
+	// 仅当响应体确实是 m3u8 时才重写;ts/mp4 等二进制分片原样透传。
+	//
+	// ⚠️ 2026-08-06 修复:重写必须在 WriteHeader **之前**完成,并且必须
+	// 重新设置 Content-Length。原来在 WriteHeader 之后 Set(Content-Length)
+	// 是无效的——CDN 原始长度被透传,重写后 body 变长/变短,ExoPlayer
+	// 按错误长度截断读取 m3u8 → 解析失败 → 无限重试(日志:同一 m3u8
+	// 请求 4 次全 200 但 ERROR_CODE_IO_NETWORK_CONNECTION_FAILED)。
+	var rewrittenBody []byte
+	if isM3U8Response(resp) {
+		if body, err := io.ReadAll(resp.Body); err == nil {
+			rewrittenBody = rewriteM3U8(body, target, r.URL.Path)
+			if !bytes.Equal(rewrittenBody, body) {
+				log.Printf("[http] app-layer m3u8 rewritten for %s%s (%d -> %d bytes)", target, r.URL.Path, len(body), len(rewrittenBody))
+			}
+		}
+	}
+
 	for k, vv := range resp.Header {
 		if hopByHopHeader(k) {
 			continue
@@ -249,23 +270,15 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+	if rewrittenBody != nil {
+		// 重写后长度可能变化:必须用最终长度覆盖(在 WriteHeader 之前设置才有效)。
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(rewrittenBody)))
+	}
 	w.WriteHeader(resp.StatusCode)
 
-	// HLS 播放列表必须重写:把相对/绝对路径引用改成基于原始域名(target)
-	// 的绝对 URL。否则播放器会按 127.0.0.1:<port>/... 解析分片路径,
-	// 丢失上游 host(X-Ech-Target),请求直接打到本机代理却无 target → 404。
-	// 仅当响应体确实是 m3u8 时才重写;ts/mp4 等二进制分片原样透传。
-	if isM3U8Response(resp) {
-		body, err := io.ReadAll(resp.Body)
-		if err == nil {
-			rewritten := rewriteM3U8(body, target, r.URL.Path)
-			if !bytes.Equal(rewritten, body) {
-				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(rewritten)))
-				log.Printf("[http] app-layer m3u8 rewritten for %s%s (%d -> %d bytes)", target, r.URL.Path, len(body), len(rewritten))
-			}
-			_, _ = w.Write(rewritten)
-			return
-		}
+	if rewrittenBody != nil {
+		_, _ = w.Write(rewrittenBody)
+		return
 	}
 	_, _ = io.Copy(w, resp.Body)
 }
