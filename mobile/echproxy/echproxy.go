@@ -162,6 +162,22 @@ func SetEndpoints(doh, ip string) error {
 	})
 }
 
+// SetOverrides hot-updates per-host fixed IP lists from the seed TXT
+// `override=` field, e.g. "www.getchu.com=210.155.150.166". Hosts listed
+// bypass DoH A/AAAA resolution and are dialed with plain TLS only —
+// used when a specific edge IP is blocked on some carriers.
+func SetOverrides(spec string) error {
+	return safe("SetOverrides", func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if server == nil {
+			return fmt.Errorf("proxy not started")
+		}
+		server.SetOverrides(spec)
+		return nil
+	})
+}
+
 // IsRunning reports whether this process currently owns a started proxy.
 func IsRunning() bool {
 	running := false

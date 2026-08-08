@@ -51,6 +51,13 @@ type Resolver struct {
 	cachePath string // optional file path for ECH config persistence
 	client    *http.Client
 
+	// overrides: per-host fixed IP list from the operator (seed TXT
+	// `override=` field). Hosts listed here bypass DoH resolution for
+	// A/AAAA and always dial these IPs with plain TLS — used when a
+	// specific edge IP is blocked on some carriers while another works
+	// (e.g. getchu.com: 210.155.150.145 blocked on mobile, .166 fine).
+	overrides map[string][]net.IP
+
 	mu    sync.RWMutex
 	cache map[string]*Result
 }
@@ -80,8 +87,48 @@ func NewWithCache(dohURL string, timeout, cacheTTL time.Duration, cachePath stri
 			Timeout:   timeout,
 			Transport: transport,
 		},
-		cache: make(map[string]*Result),
+		overrides: make(map[string][]net.IP),
+		cache:     make(map[string]*Result),
 	}
+}
+
+// SetOverrides configures per-host fixed IP lists, e.g.
+// "www.getchu.com=210.155.150.166" (multiple hosts: comma+equals are
+// ambiguous with multi-IP, so each host is its own call, or use
+// "host=ip1,ip2" per host). Hosts listed bypass DoH A/AAAA resolution
+// and are dialed with plain TLS only. Clears the DNS cache so the new
+// overrides apply immediately.
+func (r *Resolver) SetOverrides(spec string) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		r.mu.Lock()
+		r.overrides = make(map[string][]net.IP)
+		r.cache = make(map[string]*Result)
+		r.mu.Unlock()
+		return
+	}
+	parts := strings.SplitN(spec, "=", 2)
+	if len(parts) != 2 {
+		log.Printf("[dns] override spec ignored (want host=ip[,ip...]): %q", spec)
+		return
+	}
+	host := strings.ToLower(strings.TrimSpace(parts[0]))
+	var ips []net.IP
+	for _, s := range strings.Split(parts[1], ",") {
+		s = strings.TrimSpace(s)
+		if ip := net.ParseIP(s); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	if host == "" || len(ips) == 0 {
+		log.Printf("[dns] override spec ignored (bad host/IP): %q", spec)
+		return
+	}
+	r.mu.Lock()
+	r.overrides[host] = ips
+	r.cache = make(map[string]*Result) // 换配置后清缓存,避免脏结果
+	r.mu.Unlock()
+	log.Printf("[dns] override %s -> %v (plain TLS)", host, ips)
 }
 
 // Lookup resolves a hostname, returning cached results when available.
@@ -90,6 +137,20 @@ func (r *Resolver) Lookup(hostname string, preferIPv4 bool) (*Result, error) {
 	if cached, ok := r.cache[hostname]; ok && time.Now().Before(cached.ExpireAt) {
 		r.mu.RUnlock()
 		return cached, nil
+	}
+	// Per-host override: fixed IP list from the operator, no DoH A/AAAA,
+	// no ECH (plain TLS only — the override IP may be a non-CF edge).
+	if ips, ok := r.overrides[strings.ToLower(hostname)]; ok && len(ips) > 0 {
+		r.mu.RUnlock()
+		result := &Result{
+			IPs:      ips,
+			ExpireAt: time.Now().Add(r.cacheTTL),
+		}
+		r.mu.Lock()
+		r.cache[hostname] = result
+		r.mu.Unlock()
+		log.Printf("[dns] override hit for %s -> %v (plain TLS)", hostname, ips)
+		return result, nil
 	}
 	r.mu.RUnlock()
 

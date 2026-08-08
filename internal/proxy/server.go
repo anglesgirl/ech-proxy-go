@@ -146,6 +146,12 @@ func (s *Server) SetEndpoints(doh, ip string) {
 	}
 }
 
+// SetOverrides hot-updates per-host fixed IP lists (seed TXT `override=`
+// field). Hosts listed bypass DoH A/AAAA and dial with plain TLS only.
+func (s *Server) SetOverrides(spec string) {
+	s.resolver.SetOverrides(spec)
+}
+
 // handleHTTP handles HTTP requests: application-layer forwarding
 // (X-Ech-Target mode) and HTTP CONNECT tunnels.
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
