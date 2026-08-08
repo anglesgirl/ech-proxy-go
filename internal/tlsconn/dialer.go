@@ -238,7 +238,32 @@ func (dc *DialerWithCache) DialContext(ctx context.Context, network, addr string
 		return nil, fmt.Errorf("DoH lookup %s: %w", host, err)
 	}
 
+	dc.ensureECH(host, result)
+
 	return dc.DialECH(host, result)
+}
+
+// ensureECH fills result.ECH via the full ECH config chain when the plain
+// Lookup found none (target's own HTTPS record has no ech=). The chain is:
+// disk cache → cloudflare-ech.com (Cloudflare's official ECH public key,
+// valid for all AS13335-hosted zones) → target's own HTTPS ech=.
+// CF-hosted zones that don't publish ech= themselves (e.g. hanime1.me)
+// still get ECH through Cloudflare's official public key instead of
+// silently downgrading to plain TLS and leaking SNI.
+func (dc *DialerWithCache) ensureECH(host string, result *dns.Result) {
+	if result.ECH != nil && len(result.ECH.Config) > 0 {
+		return
+	}
+	b, outer, err := dc.resolver.FetchECHConfig(host)
+	if err != nil || len(b) == 0 {
+		return
+	}
+	result.ECH = &dns.ECHConfig{Config: b}
+	if outer != "" {
+		result.OuterSNI = outer
+	}
+	log.Printf("[tls] ECH config for %s from fallback chain (outer=%s, len=%d)",
+		host, outer, len(b))
 }
 
 func truncStr(s string, n int) string {
