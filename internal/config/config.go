@@ -57,7 +57,7 @@ func Default() *Config {
 		Mode:     "http",
 		LogLevel: "info",
 		TLS: TLSConfig{
-			Timeout:       "15s",
+			Timeout:       "5s",
 			SkipVerify:    false,
 			FallbackPlain: true,
 		},
