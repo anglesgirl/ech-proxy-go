@@ -250,8 +250,17 @@ func (dc *DialerWithCache) DialContext(ctx context.Context, network, addr string
 // CF-hosted zones that don't publish ech= themselves (e.g. hanime1.me)
 // still get ECH through Cloudflare's official public key instead of
 // silently downgrading to plain TLS and leaking SNI.
+//
+// ⚠️ Guard: the Cloudflare public key is only injected when the target
+// resolves to at least one AS13335 (Cloudflare) address. Non-Cloudflare
+// hosts (e.g. getchu.com behind Japanese servers that only speak TLS 1.2)
+// must stay on the plain TLS route — ECH forces TLS 1.3, so injecting the
+// CF key there breaks handshakes that would otherwise succeed.
 func (dc *DialerWithCache) ensureECH(host string, result *dns.Result) {
 	if result.ECH != nil && len(result.ECH.Config) > 0 {
+		return
+	}
+	if !hasAS13335IP(result.IPs) {
 		return
 	}
 	b, outer, err := dc.resolver.FetchECHConfig(host)
@@ -264,6 +273,18 @@ func (dc *DialerWithCache) ensureECH(host string, result *dns.Result) {
 	}
 	log.Printf("[tls] ECH config for %s from fallback chain (outer=%s, len=%d)",
 		host, outer, len(b))
+}
+
+// hasAS13335IP reports whether any of the resolved addresses belongs to
+// Cloudflare AS13335. ECH via the Cloudflare public key only makes sense
+// for such hosts.
+func hasAS13335IP(ips []net.IP) bool {
+	for _, ip := range ips {
+		if cloudflare.IsAS13335(ip.String()) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncStr(s string, n int) string {

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/anglesgirl/ech-proxy-go/internal/config"
 	"github.com/anglesgirl/ech-proxy-go/internal/dns"
 	"github.com/anglesgirl/ech-proxy-go/internal/tlsconn"
@@ -463,13 +464,25 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 		// 目标自身 HTTPS 记录无 ech= 时走完整获取链兜底
 		// (磁盘缓存 → cloudflare-ech.com CF 通用公钥 → 目标自身 ech=),
 		// 避免 CF 托管站点因未发布 ech= 而静默降级 plain TLS 泄漏 SNI。
+		// ⚠️ 仅当目标解析到 AS13335(Cloudflare) 地址时才强注 CF 公钥;
+		// 非 CF 主机(如只支持 TLS 1.2 的日本服务器)强注 ECH 会强制
+		// TLS 1.3 握手导致本可成功的连接失败。
 		if result.ECH == nil || len(result.ECH.Config) == 0 {
-			if b, outer, ferr := s.resolver.FetchECHConfig(host); ferr == nil && len(b) > 0 {
-				result.ECH = &dns.ECHConfig{Config: b}
-				if outer != "" {
-					result.OuterSNI = outer
+			as13335 := false
+			for _, ip := range result.IPs {
+				if cloudflare.IsAS13335(ip.String()) {
+					as13335 = true
+					break
 				}
-				log.Printf("[socks5] ECH config for %s from fallback chain (outer=%s, len=%d)", host, outer, len(b))
+			}
+			if as13335 {
+				if b, outer, ferr := s.resolver.FetchECHConfig(host); ferr == nil && len(b) > 0 {
+					result.ECH = &dns.ECHConfig{Config: b}
+					if outer != "" {
+						result.OuterSNI = outer
+					}
+					log.Printf("[socks5] ECH config for %s from fallback chain (outer=%s, len=%d)", host, outer, len(b))
+				}
 			}
 		}
 		targetConn, err = s.dialer.DialECH(host, result)
