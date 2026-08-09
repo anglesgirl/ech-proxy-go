@@ -175,6 +175,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// CONNECT 隧道语义:纯 TCP 转发,客户端(WebView/MPV/系统代理)自己在
 	// 隧道内做 TLS。绝不能在这里用 DialECH 返回已握手的 TLS 连接——
 	// 客户端再握一次会双重加密。ECH 只由应用层(X-Ech-Target)完成。
+	// 但 DNS 用 DoH 干净解析：绕开运营商污染（MPV 等不走 X-Ech-Target 的客户端）。
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
@@ -189,9 +190,18 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	targetConn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
+	// DoH 解析目标（带缓存/override），失败回退系统 DNS
+	targetAddr := net.JoinHostPort(host, port)
+	if result, rerr := s.resolver.Lookup(host, s.cfg.DNS.PreferIPv4); rerr == nil && len(result.IPs) > 0 {
+		targetAddr = net.JoinHostPort(result.IPs[0].String(), port)
+		log.Printf("[http] CONNECT %s via DoH %s", host, result.IPs[0])
+	} else if rerr != nil {
+		log.Printf("[http] CONNECT %s DoH failed (%v), fallback system DNS", host, rerr)
+	}
+
+	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
-		log.Printf("[http] tcp dial %s: %v", host, err)
+		log.Printf("[http] tcp dial %s: %v", targetAddr, err)
 		return
 	}
 	defer targetConn.Close()
