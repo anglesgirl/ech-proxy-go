@@ -24,6 +24,9 @@ jobs:
       - name: Install gomobile
         run: go install golang.org/x/mobile/cmd/gomobile@latest
         
+      - name: Initialize gomobile
+        run: gomobile init
+        
       - name: Build AAR
         run: |
           gomobile bind -target=android -androidapi 27 -o echproxy-arm64-v8a.aar ./mobile/echproxy
