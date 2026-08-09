@@ -19,6 +19,13 @@ type Config struct {
 	DNS      DNSConfig  `yaml:"dns"`
 	Proxy    ProxyConfig `yaml:"proxy"`
 	ECH      ECHConfig  `yaml:"ech"`
+	MITM     MITMConfig `yaml:"mitm"`
+}
+
+// MITMConfig 控制 CONNECT MITM 模式：代理下游用自签证书终止客户端 TLS，
+// 上游用 ECH/普通 TLS 连真实服务器。客户端需信任代理 CA 或跳过证书校验。
+type MITMConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 type TLSConfig struct {
