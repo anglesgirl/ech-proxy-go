@@ -19,8 +19,7 @@ jobs:
           
       - uses: android-actions/setup-android@v3
         with:
-          ndk-version: r27
-          api-level: 34
+          packages: 'ndk;27.0.12077973'
           
       - name: Install gomobile
         run: go install golang.org/x/mobile/cmd/gomobile@latest
