@@ -48,10 +48,11 @@ func (l *boundedLog) String() string {
 }
 
 var (
-	mu       sync.Mutex
-	server   *proxy.Server
-	lastInfo = "not started"
-	logs     = &boundedLog{}
+	mu          sync.Mutex
+	server      *proxy.Server
+	lastInfo    = "not started"
+	logs        = &boundedLog{}
+	mitmEnabled bool
 )
 
 // safe runs fn and converts any panic into a recorded status + error, so a
@@ -68,6 +69,23 @@ func safe(what string, fn func() error) (err error) {
 		}
 	}()
 	return fn()
+}
+
+// SetMitm 在 Start 前调用，启用/禁用 CONNECT MITM 模式。
+// MITM 让不改协议的客户端（libmpv/WebView/系统播放器）也能获得完整 ECH：
+// 代理下游用自签证书终止客户端 TLS，上游用 ECH 直连。
+// 客户端需信任代理 CA 或跳过证书校验（如 mpv tls-verify=no）。
+func SetMitm(enabled bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	mitmEnabled = enabled
+}
+
+// GetMitm 返回当前 MITM 模式开关状态
+func GetMitm() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return mitmEnabled
 }
 
 // Start launches a loopback-only HTTP CONNECT proxy.
@@ -92,6 +110,7 @@ func Start(listen, doh, cachePath string, noDowngrade bool) error {
 		cfg.Mode = "http"
 		cfg.DNS.CachePath = cachePath
 		cfg.ECH.NoDowngrade = noDowngrade
+		cfg.MITM.Enabled = mitmEnabled
 		if err := cfg.Validate(); err != nil {
 			return err
 		}
