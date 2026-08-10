@@ -506,42 +506,102 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 		}
 		// 目标自身 HTTPS 记录无 ech= 时走完整获取链兜底
 		// (磁盘缓存 → cloudflare-ech.com CF 通用公钥 → 目标自身 ech=),
-		if targetConn, err = s.dialer.DialContext(
-			conn.Context(), "tcp", net.JoinHostPort(result.IPs[0].String(), "443")); err != nil {
-			log.Printf("[socks5] ECH dial %s: %v", host, err)
+		// 避免 CF 托管站点因未发布 ech= 而静默降级 plain TLS 泄漏 SNI。
+		// ⚠️ 仅当目标解析到 AS13335(Cloudflare) 地址时才强注 CF 公钥;
+		// 非 CF 主机(如只支持 TLS 1.2 的日本服务器)强注 ECH 会强制
+		// TLS 1.3 握手导致本可成功的连接失败。
+		if result.ECH == nil || len(result.ECH.Config) == 0 {
+			as13335 := false
+			for _, ip := range result.IPs {
+				if cloudflare.IsAS13335(ip.String()) {
+					as13335 = true
+					break
+				}
+			}
+			if as13335 {
+				if b, outer, ferr := s.resolver.FetchECHConfig(host); ferr == nil && len(b) > 0 {
+					result.ECH = &dns.ECHConfig{Config: b}
+					if outer != "" {
+						result.OuterSNI = outer
+					}
+					log.Printf("[socks5] ECH config for %s from fallback chain (outer=%s, len=%d)", host, outer, len(b))
+				}
+			}
+		}
+		targetConn, err = s.dialer.DialECH(host, result)
+		if err != nil {
+			log.Printf("[socks5] ECH dial failed: %v", err)
 			conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}
 	} else {
-		var targetAddr string
-		if port == 443 && isDomain(host) {
-			if result, rerr := s.resolver.Lookup(host, s.cfg.DNS.PreferIPv4); rerr == nil && len(result.IPs) > 0 {
-				targetAddr = net.JoinHostPort(result.IPs[0].String(), "443")
-			} else {
-				targetAddr = net.JoinHostPort(host, "443")
-			}
-		} else {
-			targetAddr = net.JoinHostPort(host, fmt.Sprintf("%d", port))
-		}
-		targetConn, err = net.DialTimeout("tcp", targetAddr, 10*time.Second)
+		targetConn, err = net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
 		if err != nil {
-			log.Printf("[socks5] dial %s: %v", targetAddr, err)
+			log.Printf("[socks5] dial failed: %v", err)
 			conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}
 	}
+	defer targetConn.Close()
 
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+
 	Relay(conn, targetConn)
 }
 
-func isDomain(host string) bool {
-	ip := net.ParseIP(host)
-	return ip == nil
+// Relay bidirectionally forwards data between two connections.
+func Relay(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		io.Copy(a, b)
+		done <- struct{}{}
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(b, a)
+		done <- struct{}{}
+	}()
+
+	<-done
+	a.Close()
+	b.Close()
+	wg.Wait()
+}
+
+func isDomain(s string) bool {
+	return net.ParseIP(s) == nil
 }
 
 func parseInt(s string) int {
-	var n int
-	fmt.Sscanf(s, "%d", &n)
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
 	return n
+}
+
+// validHost accepts lowercase DNS host names only (no ports/paths/IPs/special
+// chars). It mirrors the old upstream validation to keep per-host routing safe.
+func validHost(value string) bool {
+	if value == "" || len(value) > 253 || net.ParseIP(value) != nil || strings.ContainsAny(value, "/:@?#\\") {
+		return false
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(value, "."), ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r == '-' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+				return false
+			}
+		}
+	}
+	return true
 }
