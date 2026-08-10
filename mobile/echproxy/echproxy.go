@@ -88,6 +88,20 @@ func GetMitm() bool {
 	return mitmEnabled
 }
 
+// GetCAPem 返回 MITM CA 证书（PEM 格式），供 Android 写入文件/安装信任
+func GetCAPem() string {
+	var pem string
+	_ = safe("GetCAPem", func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if server != nil && server.mitm != nil {
+			pem = string(server.mitm.caPEM())
+		}
+		return nil
+	})
+	return pem
+}
+
 // Start launches a loopback-only HTTP CONNECT proxy.
 func Start(listen, doh, cachePath string, noDowngrade bool) error {
 	return safe("Start", func() error {
