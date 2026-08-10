@@ -159,11 +159,7 @@ func (s *Server) SetEndpoints(doh, ip string) {
 	}
 }
 
-// SetOverrides hot-updates per-host fixed IP lists (seed TXT `override=`
-// field). Hosts listed bypass DoH A/AAAA and dial with plain TLS only.
-func (s *Server) SetOverrides(spec string) {
-	s.resolver.SetOverrides(spec)
-}
+// SetOverrides hot-updates per-host fixed IP lists (seed TXT `override=`\n// field). Hosts listed bypass DoH A/AAAA and dial with plain TLS only.\nfunc (s *Server) SetOverrides(spec string) {\n	s.resolver.SetOverrides(spec)\n}\n\n// GetMitmCAPem 返回 MITM CA 证书（PEM 格式），供外部导出/安装信任\nfunc (s *Server) GetMitmCAPem() []byte {\n	if s.mitm != nil {\n		return s.mitm.caPEM()\n	}\n	return nil\n}
 
 // handleHTTP handles HTTP requests: application-layer forwarding
 // (X-Ech-Target mode) and HTTP CONNECT tunnels.

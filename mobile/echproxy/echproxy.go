@@ -94,8 +94,8 @@ func GetCAPem() string {
 	_ = safe("GetCAPem", func() error {
 		mu.Lock()
 		defer mu.Unlock()
-		if server != nil && server.mitm != nil {
-			pem = string(server.mitm.caPEM())
+		if server != nil {
+			pem = string(server.GetMitmCAPem())
 		}
 		return nil
 	})
