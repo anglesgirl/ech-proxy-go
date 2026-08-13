@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strings"
@@ -145,12 +146,21 @@ func New(cfg *config.Config) *Server {
 	// 应用层转发:用 DialerWithCache 作为 DialTLSContext,
 	// http.Client 的每个请求都会经 DoH + ECH(或普通 TLS) 连上游。
 	appLayerDialer := tlsconn.NewWithCache(dialer, resolver)
+	// ⚠️ 2026-08-13 实测: 必须有 cookie jar! CF jsd 验证完成时 Set-Cookie
+	// cf_clearance(代理转发响应,client.Do 自动存 jar,按 archiveofourown.org
+	// 域)→ 登录 POST 转发时 jar 按 URL 域匹配自动带上 cf_clearance →
+	// AO3 放行。没有 jar → POST 无验证凭据 → 302 auth_error(playwright 实测)。
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		log.Fatalf("[proxy] cookiejar init failed: %v", err)
+	}
 	srv.appLayerClient = &http.Client{
 		Transport: &http.Transport{
 			DialTLSContext:    appLayerDialer.DialContext,
 			ForceAttemptHTTP2: true, // Go>=1.21 默认 false；必须显式开启 HTTP/2
 			Proxy:             nil,
 		},
+		Jar:     jar,
 		Timeout: 60 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
