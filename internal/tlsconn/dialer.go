@@ -10,6 +10,7 @@ package tlsconn
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -22,7 +23,6 @@ import (
 	"github.com/anglesgirl/ech-proxy-go/internal/certutil"
 	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/anglesgirl/ech-proxy-go/internal/dns"
-	utls "github.com/refraction-networking/utls"
 )
 
 // Dialer establishes ECH TLS connections.
@@ -31,7 +31,7 @@ type Dialer struct {
 	skipVerify    bool
 	fallbackPlain bool // ECH failed → plain TLS (set false for protected hosts)
 	customIPs     []string
-	certPool      *utls.Config
+	certPool      *tls.Config
 	// onRetryConfig, when set, persists a server-provided retry_configs to the
 	// disk cache so the next connection handshakes straight from cache.
 	onRetryConfig func(host string, config []byte)
@@ -51,7 +51,7 @@ func New(timeout time.Duration, skipVerify, fallbackPlain bool) *Dialer {
 		fallbackPlain: fallbackPlain,
 	}
 	if pool := certutil.LoadSystemCertPool(); pool != nil {
-		d.certPool = &utls.Config{RootCAs: pool, MinVersion: utls.VersionTLS12}
+		d.certPool = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
 	return d
 }
@@ -102,9 +102,9 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 		candidates = append(candidates, net.JoinHostPort(ip, port))
 	}
 
-	tlsConfig := &utls.Config{
+	tlsConfig := &tls.Config{
 		ServerName:         hostname,
-		MinVersion:         utls.VersionTLS12,
+		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: d.skipVerify,
 		NextProtos:         []string{"h2", "http/1.1"},
 	}
@@ -116,7 +116,7 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 	hasECH := result.ECH != nil && len(result.ECH.Config) > 0
 	if hasECH {
 		// ECH 只在 TLS 1.3 中定义，故 ECH 连接必须强制 1.3。
-		tlsConfig.MinVersion = utls.VersionTLS13
+		tlsConfig.MinVersion = tls.VersionTLS13
 		tlsConfig.EncryptedClientHelloConfigList = result.ECH.Config
 		if result.OuterSNI != "" {
 			outerName := strings.TrimSuffix(result.OuterSNI, ".")
@@ -142,14 +142,14 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 		log.Printf("[tls] handshake via %s failed: %v", addr, err)
 
 		// ECH rejection: try server-provided retry_configs.
-		var rej *utls.ECHRejectionError
+		var rej *tls.ECHRejectionError
 		if hasECH && errors.As(err, &rej) && len(rej.RetryConfigList) > 0 {
 			log.Printf("[tls] ECH rejected via %s; retrying with server retry_configs", addr)
 			retryConfig := tlsConfig.Clone()
 			retryConfig.EncryptedClientHelloConfigList = rej.RetryConfigList
 			conn, retryErr := d.dialTLS(addr, retryConfig, hostname)
 			if retryErr == nil {
-				if tlsConn, ok := conn.(*utls.UConn); ok && tlsConn.ConnectionState().ECHAccepted {
+				if tlsConn, ok := conn.(*tls.Conn); ok && tlsConn.ConnectionState().ECHAccepted {
 					log.Printf("[tls] ECH accepted via %s (retry_configs)", addr)
 				}
 				// 缓存 server retry_configs,下次直接用它握手。
@@ -165,10 +165,10 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 	// Fallback to plain TLS (only if allowed and ECH was attempted).
 	if hasECH && d.fallbackPlain {
 		log.Printf("[tls] all ECH attempts failed for %s, falling back to plain TLS", hostname)
-		plainConfig := &utls.Config{
+		plainConfig := &tls.Config{
 			ServerName: hostname,
 			// plain TLS 兼容老 CDN（只支持 TLS 1.2，如内容页静态资源源站）。
-			MinVersion:         utls.VersionTLS12,
+			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: d.skipVerify,
 			NextProtos:         []string{"h2", "http/1.1"},
 		}
@@ -191,18 +191,14 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 		hostname, len(candidates), lastErr)
 }
 
-func (d *Dialer) dialTLS(addr string, cfg *utls.Config, hostname string) (net.Conn, error) {
+func (d *Dialer) dialTLS(addr string, cfg *tls.Config, hostname string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: d.timeout}
 	rawConn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("tcp dial %s: %w", addr, err)
 	}
 
-	// 用 utls 模拟浏览器 TLS 指纹(Chrome),避免 CF 依据 JA3/ClientHello
-	// 指纹判定为自动化工具而触发 challenge。Go 标准库 crypto/tls 的
-	// ClientHello 结构(扩展顺序/密码套件)与任何浏览器都不同,福建实测
-	// 同 IP 下火狐直接登录无验证、CO3 却每次撞 challenge。
-	tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
+	tlsConn := tls.Client(rawConn, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
 	defer cancel()
 
@@ -227,9 +223,9 @@ func (d *Dialer) dialTLS(addr string, cfg *utls.Config, hostname string) (net.Co
 
 func tlsVersionName(v uint16) string {
 	switch v {
-	case utls.VersionTLS13:
+	case tls.VersionTLS13:
 		return "1.3"
-	case utls.VersionTLS12:
+	case tls.VersionTLS12:
 		return "1.2"
 	default:
 		return fmt.Sprintf("0x%04x", v)
