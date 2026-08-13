@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -367,6 +368,20 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 		if resp.Uncompressed && (k == "Content-Encoding" || k == "Content-Length") {
 			continue
 		}
+		if k == "Set-Cookie" {
+			// WebView 页面 origin 是 http://127.0.0.1:<port>(代理地址),而
+			// AO3/CF 的 Set-Cookie 带 Domain=archiveofourown.org + Secure
+			// (+SameSite=None 必须配 Secure)→ 浏览器按跨域拒收 / Secure
+			// cookie 不在 http 页面发送 → cf_clearance/session 进不了
+			// WebView → 登录 POST 无验证凭据 → AO3 302 auth_error(实测)。
+			// 改写: 去掉 Domain(变 host-only 按 127.0.0.1 存) + 去掉 Secure
+			// + SameSite=None→Lax(http 页面可发送可收)。Go jar 不受影响:
+			// jar 在 client.Do 内部已按原始 Set-Cookie 存好(archiveofourown.org 域)。
+			for _, v := range vv {
+				w.Header().Add(k, rewriteCookieForWebView(v))
+			}
+			continue
+		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
@@ -382,6 +397,17 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// rewriteCookieForWebView 把上游 Set-Cookie 改写成 WebView(127.0.0.1 页面)
+// 能收能发的形式: 去掉 Domain(host-only,按页面域 127.0.0.1 存)、去掉
+// Secure、SameSite=None→Lax(SameSite=None 强制要求 Secure,不改成 http
+// 页面会拒收)。值/Expires/Max-Age/Path/HttpOnly 保留。
+func rewriteCookieForWebView(sc string) string {
+	sc = regexp.MustCompile(`(?i);\s*Domain=[^;]*`).ReplaceAllString(sc, "")
+	sc = regexp.MustCompile(`(?i);\s*Secure\b`).ReplaceAllString(sc, "")
+	sc = regexp.MustCompile(`(?i);\s*SameSite=None`).ReplaceAllString(sc, "; SameSite=Lax")
+	return sc
 }
 
 // resolveTarget determines the upstream host for an app-layer request.

@@ -227,7 +227,14 @@ func dialTLSUtls(d *Dialer, addr string, cfg *utls.Config, hostname string) (net
 
 	// 用 utls 模拟浏览器 TLS 指纹(Chrome),避免 CF 依据 JA3/ClientHello
 	// 指纹判定为自动化工具而触发 challenge。
-	tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
+	// ⚠️ 2026-08-13 实测: utls.UConn 不是 *tls.Conn,Go http.Transport 的
+	// addTLS 类型断言读不到其 ConnectionState → ALPN=h2 不被感知 → 用
+	// HTTP/1.1 解析服务器发来的 h2 帧 → "malformed HTTP response" 502。
+	// 修复: utls 通道 ALPN 只 offer http/1.1(服务器选 h1,无乱码)。
+	// 指纹的 ALPN 段微调,CF 主要看 JA3 结构,影响可忽略。
+	tlsCfg := *cfg
+	tlsCfg.NextProtos = []string{"http/1.1"}
+	tlsConn := utls.UClient(rawConn, &tlsCfg, utls.HelloChrome_Auto)
 	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
 	defer cancel()
 
