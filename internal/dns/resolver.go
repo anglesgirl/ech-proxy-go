@@ -552,6 +552,15 @@ func StoreECHCacheFile(path, host string, config []byte) {
 // 托管的 AS13335 目标(archiveofourown.org 即其中之一)。
 const cloudflareECHHost = "cloudflare-ech.com"
 
+// builtinCFECHConfig 是 cloudflare-ech.com 当前 HTTPS 记录的 ech= 参数快照,
+// 内置为最后兜底:部分区域(如福建)会封禁 cloudflare-ech.com 的 IP 或干扰
+// DoH 查询,导致公共 ECH 公钥永远拉不到、缓存永远填充不了。内置一份后,
+// 即使 DoH/cloudflare-ech.com 全挂,AS13335 主机仍能用这份公钥发起 ECH
+// 握手;若公钥已轮换,服务器会返回 retry_configs,代码自动用新公钥重试并
+// 更新缓存(见 dialer.go 的 ECHRejectionError 处理),所以内置值过期无害。
+// 2026-08-13 抓取自 cloudflare-ech.com HTTPS 记录。
+const builtinCFECHConfigB64 = "AEX+DQBBNAAgACCyup0GYiVj1Iph45mjgzNuuKu0qMra6LGPbZVfMTXgJwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA="
+
 // CacheECHConfig persists an ECHConfigList for a host to the disk cache.
 // Exported so the dialer can cache server-provided retry_configs too.
 func (r *Resolver) CacheECHConfig(host string, config []byte) {
@@ -588,6 +597,16 @@ func (r *Resolver) FetchECHConfig(host string) ([]byte, string, error) {
 		r.CacheECHConfig(host, ech.Config)
 		log.Printf("[dns] ECH config for %s from target HTTPS ech=", host)
 		return ech.Config, outerName, nil
+	}
+
+	// 4. 内置 Cloudflare 公共公钥(最后兜底)。
+	// 部分区域封禁 cloudflare-ech.com 的 IP / 干扰 DoH,导致上面 1-3 全失败。
+	// 内置快照保证 AS13335 主机仍能发起 ECH 握手;公钥轮换由服务器
+	// retry_configs 兜底(握手被拒时自动更新),无需网络拉取也能自愈。
+	if b, err := base64.StdEncoding.DecodeString(builtinCFECHConfigB64); err == nil && len(b) > 0 {
+		r.CacheECHConfig(host, b)
+		log.Printf("[dns] ECH config for %s from built-in Cloudflare public key (fallback)", host)
+		return b, cloudflareECHHost, nil
 	}
 
 	return nil, "", fmt.Errorf("no ECH config available for %s", host)

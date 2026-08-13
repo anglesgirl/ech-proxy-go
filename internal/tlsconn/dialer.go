@@ -62,6 +62,30 @@ func (d *Dialer) SetCustomIPs(ipList string) {
 	d.customIPs = cloudflare.FilterAS13335(cloudflare.ParseIPList(ipList))
 }
 
+// AppendCustomIPs adds more candidate edge IPs (already validated by caller)
+// to the end of the custom list, deduplicating against existing entries.
+func (d *Dialer) AppendCustomIPs(ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(d.customIPs)+len(ips))
+	for _, ip := range d.customIPs {
+		seen[ip] = true
+	}
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || seen[ip] {
+			continue
+		}
+		// 只接受 AS13335:ECH 配置只对 Cloudflare 边缘有效。
+		if !cloudflare.IsAS13335(ip) {
+			continue
+		}
+		seen[ip] = true
+		d.customIPs = append(d.customIPs, ip)
+	}
+}
+
 // DialECH establishes an ECH TLS connection to hostname using DNS results.
 func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) {
 	if len(result.IPs) == 0 {

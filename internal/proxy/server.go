@@ -34,6 +34,47 @@ type Server struct {
 	mitm *mitmCA
 }
 
+// builtinDoHHostIPs 是 Cloudflare Gateway DoH 端点域名当前解析的 IP 快照
+// (2026-08-13 实测 pieqllv9i7.cloudflare-gateway.com → 162.159.36.5/20)。
+// 这些 IP 属于 AS13335,且部分区域(福建)封禁目标站点 CF 边缘 IP 时
+// DoH 端点 IP 仍可达(否则 DoH 连不上)。作为 resolveDoHHostIPs 的兜底,
+// 系统 DNS 也被污染时仍能拿到可用候选。
+var builtinDoHHostIPs = []string{"162.159.36.5", "162.159.36.20"}
+
+// resolveDoHHostIPs 解析 DoH 端点域名(如 pieqllv9i7.cloudflare-gateway.com)
+// 的 IP 列表,用于自动并入 ECH 握手候选。系统 DNS 解析失败时回退内置快照。
+func resolveDoHHostIPs(dohURL string) []string {
+	u, err := url.Parse(dohURL)
+	if err != nil || u.Hostname() == "" {
+		return nil
+	}
+	host := u.Hostname()
+
+	// 1. 系统 DNS 解析(DoH 端点域名一般未被污染)。
+	var ips []string
+	if addrs, err := net.LookupHost(host); err == nil {
+		for _, a := range addrs {
+			if net.ParseIP(a) != nil {
+				ips = append(ips, a)
+			}
+		}
+	}
+	// 2. 内置快照兜底。
+	for _, b := range builtinDoHHostIPs {
+		found := false
+		for _, a := range ips {
+			if a == b {
+				found = true
+				break
+			}
+		}
+		if !found {
+			ips = append(ips, b)
+		}
+	}
+	return ips
+}
+
 // New creates a proxy server from configuration.
 func New(cfg *config.Config) *Server {
 	tlsTimeout, _ := time.ParseDuration(cfg.TLS.Timeout)
@@ -61,9 +102,21 @@ func New(cfg *config.Config) *Server {
 	}
 
 	dialer := tlsconn.New(tlsTimeout, cfg.TLS.SkipVerify, fallbackPlain)
+	// 自定义边缘 IP 配置(用户显式填写)。
 	if cfg.ECH.CustomIPs != "" {
 		dialer.SetCustomIPs(cfg.ECH.CustomIPs)
 		log.Printf("[proxy] custom edge IPs configured: %s", cfg.ECH.CustomIPs)
+	}
+	// 自动把 DoH 端点的 IP 并入 ECH 握手候选。
+	// 关键洞察(2026-08-13 实测):DoH 端点(如 pieqllv9i7.cloudflare-gateway.com)
+	// 解析到 162.159.36.5/20,属于 Cloudflare AS13335。某些区域(福建)会封禁
+	// 目标站点(archiveofourown.org)解析到的 104.18.x.x 等 CF 边缘 IP,但 DoH
+	// 端点 IP 可达(否则 DoH 都连不上,YouTube 也打不开)。ECH 握手只要连到
+	// 任意一个可达的 AS13335 边缘即可——DoH 端点 IP 天然满足,直接复用。
+	// 用户显式填了 custom_ips 时不覆盖,只做补充。
+	if ips := resolveDoHHostIPs(cfg.DoH); len(ips) > 0 {
+		dialer.AppendCustomIPs(ips)
+		log.Printf("[proxy] auto-added DoH endpoint IPs to ECH candidates: %s", strings.Join(ips, ","))
 	}
 	// ECH 握手被拒且服务器给了 retry_configs 时,缓存到磁盘供下次直接使用。
 	dialer.SetRetryConfigSink(func(host string, config []byte) {
