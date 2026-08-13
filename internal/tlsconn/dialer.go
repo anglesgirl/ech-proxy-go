@@ -22,6 +22,7 @@ import (
 	"github.com/anglesgirl/ech-proxy-go/internal/certutil"
 	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/anglesgirl/ech-proxy-go/internal/dns"
+	"crypto/tls"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -192,6 +193,32 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 }
 
 func (d *Dialer) dialTLS(addr string, cfg *utls.Config, hostname string) (net.Conn, error) {
+	// 先尝试 utls(Chrome 指纹,降低 CF challenge 概率)。
+	conn, err := dialTLSUtls(d, addr, cfg, hostname)
+	if err == nil {
+		return conn, nil
+	}
+	// utls 握手失败(GFW 内实测 502)→ 自动降级 crypto/tls 重试同一地址。
+	// Go 1.24+ 的 ECH outer SNI 用 public_name 伪装,GFW 放行;指纹是 Go
+	// 的会触发 CF challenge,由验证窗口流程兜底。
+	log.Printf("[tls] utls handshake via %s failed: %v; retrying with crypto/tls", addr, err)
+	return dialTLSStd(d, addr, toStdTLSConfig(cfg), hostname)
+}
+
+// toStdTLSConfig converts a utls.Config to a stdlib tls.Config for the
+// fallback handshake. ECH config is carried over unchanged.
+func toStdTLSConfig(cfg *utls.Config) *tls.Config {
+	return &tls.Config{
+		ServerName:                     cfg.ServerName,
+		MinVersion:                     cfg.MinVersion,
+		InsecureSkipVerify:             cfg.InsecureSkipVerify,
+		NextProtos:                     cfg.NextProtos,
+		RootCAs:                        cfg.RootCAs,
+		EncryptedClientHelloConfigList: cfg.EncryptedClientHelloConfigList,
+	}
+}
+
+func dialTLSUtls(d *Dialer, addr string, cfg *utls.Config, hostname string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: d.timeout}
 	rawConn, err := dialer.Dial("tcp", addr)
 	if err != nil {
@@ -199,9 +226,7 @@ func (d *Dialer) dialTLS(addr string, cfg *utls.Config, hostname string) (net.Co
 	}
 
 	// 用 utls 模拟浏览器 TLS 指纹(Chrome),避免 CF 依据 JA3/ClientHello
-	// 指纹判定为自动化工具而触发 challenge。Go 标准库 crypto/tls 的
-	// ClientHello 结构(扩展顺序/密码套件)与任何浏览器都不同,福建实测
-	// 同 IP 下火狐直接登录无验证、CO3 却每次撞 challenge。
+	// 指纹判定为自动化工具而触发 challenge。
 	tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
 	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
 	defer cancel()
@@ -211,17 +236,43 @@ func (d *Dialer) dialTLS(addr string, cfg *utls.Config, hostname string) (net.Co
 		return nil, err
 	}
 
-	// Log ECH acceptance status.
 	state := tlsConn.ConnectionState()
 	if cfg.EncryptedClientHelloConfigList != nil {
 		if state.ECHAccepted {
-			log.Printf("[tls] ECH ACCEPTED for %s via %s (TLS %s, ALPN %q)",
+			log.Printf("[tls] ECH ACCEPTED for %s via %s (TLS %s, ALPN %q, utls)",
 				hostname, addr, tlsVersionName(state.Version), state.NegotiatedProtocol)
 		} else {
 			log.Printf("[tls] WARNING: ECH was NOT accepted by server for %s via %s", hostname, addr)
 		}
 	}
+	return tlsConn, nil
+}
 
+func dialTLSStd(d *Dialer, addr string, cfg *tls.Config, hostname string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: d.timeout}
+	rawConn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("tcp dial %s: %w", addr, err)
+	}
+
+	tlsConn := tls.Client(rawConn, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
+	defer cancel()
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+
+	state := tlsConn.ConnectionState()
+	if cfg.EncryptedClientHelloConfigList != nil {
+		if state.ECHAccepted {
+			log.Printf("[tls] ECH ACCEPTED for %s via %s (TLS %s, ALPN %q, crypto/tls)",
+				hostname, addr, tlsVersionName(state.Version), state.NegotiatedProtocol)
+		} else {
+			log.Printf("[tls] WARNING: ECH was NOT accepted by server for %s via %s", hostname, addr)
+		}
+	}
 	return tlsConn, nil
 }
 
