@@ -25,6 +25,9 @@ class MainActivity : ComponentActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main)
     private var probing = false
+    private var lastResult: String? = null
+    private lateinit var resultView: TextView
+    private lateinit var logScroll: ScrollView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,6 +72,8 @@ class MainActivity : ComponentActivity() {
             typeface = android.graphics.Typeface.MONOSPACE
         }
         content.addView(result)
+        resultView = result
+        logScroll = root
 
         val exportBtn = Button(this).apply { text = "导出结果 txt" }
         content.addView(exportBtn)
@@ -86,7 +91,7 @@ class MainActivity : ComponentActivity() {
                 Toast.makeText(this, "请输入域名", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            result.text = ""
+            resultView.text = ""
             runBtn.isEnabled = false
             runBtn.text = "测试中..."
             probing = true
@@ -136,7 +141,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (startErr != null) {
-            result.append("启动失败: ${startErr.message}\n")
+            resultView.append("启动失败: ${startErr.message}\n")
             finishProbe(runBtn)
             return
         }
@@ -152,9 +157,9 @@ class MainActivity : ComponentActivity() {
             }
             if (delta.isNotEmpty()) {
                 sb.append(delta)
-                result.text = sb.toString()
+                resultView.text = sb.toString()
                 // 自动滚到底部
-                (result.parent as? ScrollView)?.post { it.fullScroll(ScrollView.FOCUS_DOWN) }
+                logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
             }
             if (done) {
                 // 取最终完整报告供导出
@@ -173,6 +178,4 @@ class MainActivity : ComponentActivity() {
         runBtn.isEnabled = true
         runBtn.text = "开始测试（强制 ECH，无降级）"
     }
-
-    private var lastResult: String? = null
 }
