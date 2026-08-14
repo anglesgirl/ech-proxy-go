@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.EchBrowser" parent="android:Theme.Material.NoActionBar">
+    <!-- AppCompatActivity 强制要求 Theme.AppCompat 系列，否则 super.onCreate 崩溃 -->
+    <style name="Theme.EchBrowser" parent="Theme.AppCompat.NoActionBar">
         <item name="android:statusBarColor">#101428</item>
         <item name="android:navigationBarColor">#101428</item>
     </style>

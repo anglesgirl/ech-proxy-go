@@ -40,8 +40,11 @@ class MainActivity : AppCompatActivity() {
     private val DOH_URL = "https://$DOH_DOMAIN:$DOH_PORT/dns-query"
 
     override fun onCreate(state: Bundle?) {
+        // 日志必须在 super 之前！super.onCreate 可能崩溃（主题等），
+        // 这样崩溃点也能被记录。
+        EchApp.log("APP", "MainActivity.onCreate ENTER (before super)")
         super.onCreate(state)
-        EchApp.log("APP", "MainActivity.onCreate start")
+        EchApp.log("APP", "MainActivity.onCreate start (after super)")
         try {
             window.statusBarColor = Color.rgb(16, 20, 40)
             buildUi()
