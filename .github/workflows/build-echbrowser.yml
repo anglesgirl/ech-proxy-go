@@ -1,0 +1,61 @@
+name: Build ECH Browser APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android-echbrowser/**'
+      - 'mobile/echdoh/**'
+      - 'certs/**'
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;27.0.12077973'
+
+      - name: Install gomobile
+        run: go install golang.org/x/mobile/cmd/gomobile@latest
+
+      - name: Initialize gomobile
+        run: gomobile init
+
+      - name: Build Go DoH AAR
+        run: |
+          mkdir -p android-echbrowser/app/libs
+          gomobile bind -javapkg com.anglesgirl.echbrowser -target=android -androidapi 27 -o android-echbrowser/app/libs/echdoh.aar ./mobile/echdoh
+
+      - name: Inject DoH cert from secrets
+        run: |
+          mkdir -p android-echbrowser/app/src/main/assets
+          echo "${{ secrets.DOH_CERT_PEM }}" > android-echbrowser/app/src/main/assets/doh-fullchain.pem
+          echo "${{ secrets.DOH_KEY_PEM }}" > android-echbrowser/app/src/main/assets/doh-key.pem
+          openssl x509 -in android-echbrowser/app/src/main/assets/doh-fullchain.pem -noout -subject -dates
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build APK
+        run: |
+          cd android-echbrowser
+          gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: echbrowser-apk
+          path: android-echbrowser/app/build/outputs/apk/debug/*.apk
