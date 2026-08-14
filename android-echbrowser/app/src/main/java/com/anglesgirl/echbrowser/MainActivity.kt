@@ -118,6 +118,8 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(8, 8, 8, 0)
             setBackgroundColor(Color.rgb(16, 20, 40))
+            // 让内容避开状态栏（状态栏遮挡修复）
+            fitsSystemWindows = true
         }
         val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         address = EditText(this).apply {
@@ -204,11 +206,10 @@ class MainActivity : AppCompatActivity() {
             override fun onLoadError(
                 s: GeckoSession,
                 uri: String?,
-                error: Int,
-                errorClass: Int
-            ): org.mozilla.geckoview.GeckoResult<Boolean>? {
-                // 错误码: ERROR_UNKNOWN_HOST=-4, ERROR_SECURITY_SSL=-5, ERROR_NET_TIMEOUT=-10 等
-                EchApp.log("GECKO", "loadError uri=$uri error=$error class=$errorClass")
+                error: org.mozilla.geckoview.WebRequestError
+            ): org.mozilla.geckoview.GeckoResult<String>? {
+                // 错误码: ERROR_HOST_LOOKUP, ERROR_SECURITY_SSL, ERROR_TIMEOUT 等
+                EchApp.log("GECKO", "loadError uri=$uri error=${error.code} msg=${error.message}")
                 return null // 不处理,让 GeckoView 显示错误页
             }
 
