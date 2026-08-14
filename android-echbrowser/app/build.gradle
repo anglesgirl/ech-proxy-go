@@ -29,6 +29,15 @@ android {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+        debug {
+            packaging {
+                jniLibs {
+                    // 允许压缩 so 进 APK（否则 libxul.so 150MB 原样 Stored，APK 197MB）
+                    // 安装时解压，GeckoView 兼容
+                    useLegacyPackaging = true
+                }
+            }
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
