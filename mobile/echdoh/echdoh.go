@@ -421,18 +421,25 @@ func forceRewriteA(resp *dns.Msg, name string) {
 		}
 	}
 	seen := map[string]bool{}
+	added := 0
 	for _, ip := range hintIPs {
 		if seen[ip] {
 			continue
 		}
 		seen[ip] = true
+		// 限 6 个：18 个 IP 会让 Firefox 依次试不完（每个超时 2-3s）
+		// 就 loadError 了；6 个内快速试完，打不开的换下一个。
+		if added >= 6 {
+			break
+		}
+		added++
 		newAnswers = append(newAnswers, &dns.A{
 			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
 			A:   net.ParseIP(ip),
 		})
 	}
 	resp.Answer = newAnswers
-	slog("%s: FORCED A -> %v", name, hintIPs)
+	slog("%s: FORCED A -> %v (%d)", name, hintIPs[:min(added, len(hintIPs))], added)
 }
 
 // injectECHForced 无条件注入 CF 公共 ECH 公钥（不判断是否 CF 托管）。
@@ -460,10 +467,13 @@ func injectECHForced(resp *dns.Msg, name string) {
 		},
 	}
 	if len(hintIPs) > 0 {
-		hints := make([]net.IP, 0, len(hintIPs))
+		hints := make([]net.IP, 0, 6)
 		for _, h := range hintIPs {
 			if ip := net.ParseIP(h); ip != nil {
 				hints = append(hints, ip)
+				if len(hints) >= 6 {
+					break
+				}
 			}
 		}
 		if len(hints) > 0 {
@@ -471,7 +481,7 @@ func injectECHForced(resp *dns.Msg, name string) {
 		}
 	}
 	resp.Answer = []dns.RR{svcb}
-	slog("FORCED ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
+	slog("FORCED ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs[:min(6, len(hintIPs))])
 }
 
 // isCloudflareHosted 跟随 CNAME 链（≤5 跳）查询目标 A 记录，判断是否
@@ -610,7 +620,17 @@ func fetchDohEndpointIPv4s() []string {
 		}
 	}
 
-	// 扫描池（启动时随机扫到的可达 CF IP）优先
+	// 优先级：用户实测 12 个（最可信）> 扫描池 > 内置快照
+	// 用户 2026-08-14 大陆实测可达列表（Firefox 会先试这些）
+	for _, ip := range []string{
+		"104.17.16.197", "104.19.43.13", "104.19.2.117",
+		"172.64.52.66", "108.162.193.202", "172.64.53.55",
+		"162.159.45.255", "162.159.38.37", "172.64.229.216",
+		"162.159.44.0", "108.162.198.221", "162.159.39.151",
+	} {
+		add(ip)
+	}
+	// 扫描池（启动时随机扫到的可达 CF IP）
 	for _, ip := range reachableCFIPs() {
 		add(ip)
 	}
