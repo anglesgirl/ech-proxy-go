@@ -31,7 +31,7 @@ jobs:
       - name: Build Go AAR
         run: |
           mkdir -p android-xprobe/app/libs
-          gomobile bind -target=android -androidapi 27 -o android-xprobe/app/libs/echproxy.aar ./mobile/echproxy
+          gomobile bind -javapkg com.anglesgirl.xprobe.golib -target=android -androidapi 27 -o android-xprobe/app/libs/echproxy.aar ./mobile/echproxy
 
       - uses: actions/setup-java@v4
         with:

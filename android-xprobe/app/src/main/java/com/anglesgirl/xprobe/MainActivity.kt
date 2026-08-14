@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity() {
         content.addView(dohLabel)
         val dohInput = EditText(this).apply {
             setText("https://pieqllv9i7.cloudflare-gateway.com/dns-query")
-            singleLine = true
+            maxLines = 1
         }
         content.addView(dohInput)
 
@@ -53,7 +53,7 @@ class MainActivity : ComponentActivity() {
         content.addView(hostsLabel)
         val hostsInput = EditText(this).apply {
             setText("x.com,www.x.com,api.x.com,video.twimg.com,abs.twimg.com,pbs.twimg.com")
-            singleLine = true
+            maxLines = 1
         }
         content.addView(hostsInput)
 
@@ -85,8 +85,8 @@ class MainActivity : ComponentActivity() {
             scope.launch {
                 val output = withContext(Dispatchers.IO) {
                     try {
-                        // gomobile 绑定：包 echproxy，类 Echproxy
-                        echproxy.Echproxy.XProbe(doh, hosts)
+                        // gomobile 绑定：javapkg com.anglesgirl.xprobe.golib，类 Echproxy
+                        com.anglesgirl.xprobe.golib.Echproxy.XProbe(doh, hosts)
                     } catch (e: Throwable) {
                         "调用失败: ${e.message}\n${e.stackTraceToString()}"
                     }
