@@ -43,8 +43,10 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = '17'
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
     }
     buildFeatures {
         buildConfig true
@@ -52,7 +54,10 @@ android {
 }
 
 dependencies {
-    implementation "org.mozilla.geckoview:geckoview:147.0.20260116091309"
+    // GeckoView 153.03132010：桌面 Firefox 153 实测注入 ECH 能开 x.com；
+    // 147 的 ECH 实现疑似不完整（x.com TLS 成功但页面失败）。
+    // ⚠️ 不要升 20260810（真机启动即 native crash）
+    implementation "org.mozilla.geckoview:geckoview:153.0.20260803132010"
     implementation 'androidx.core:core-ktx:1.17.0'
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation fileTree(dir: 'libs', include: ['*.aar'])

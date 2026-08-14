@@ -149,8 +149,9 @@ class MainActivity : AppCompatActivity() {
                 appendLine("  network.trr.mode: 3")
                 appendLine("  network.trr.uri: \"$DOH_URI\"")
                 appendLine("  network.trr.excluded-domains: \"\"")
-                appendLine("  network.dns.echloop: true")
-                appendLine("  network.dns.use_https_rr_as_altns: true")
+                // 对齐桌面 Firefox 验证成功配置（2026-08-14 桌面 x.com 打开）
+                // 不设 echloop / use_https_rr_as_altns（ao3-kiosk 的 AO3 专用，
+                // 对注入 ech= 场景疑似副作用）
                 appendLine("  dom.security.https_only_mode: true")
             }
             val configFile = File(filesDir, "geckoview-config.yaml")
@@ -183,14 +184,6 @@ class MainActivity : AppCompatActivity() {
                 ): org.mozilla.geckoview.GeckoResult<String>? {
                     log("ERR", "loadError uri=$uri code=${error.code} msg=${error.message}")
                     return null
-                }
-
-                override fun onResponseReceived(
-                    s: GeckoSession,
-                    response: org.mozilla.geckoview.GeckoSession.NavigationDelegate.WebResponseInfo
-                ) {
-                    // HTTP 状态码 + 内容类型：判断是 403 拦截还是 200 正常
-                    log("HTTP", "resp uri=${response.uri} status=${response.statusCode} type=${response.contentType}")
                 }
 
                 override fun onCanGoBack(s: GeckoSession, canGoBack: Boolean) {}

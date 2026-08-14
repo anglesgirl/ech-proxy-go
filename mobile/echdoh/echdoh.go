@@ -311,7 +311,9 @@ func injectECH(resp *dns.Msg, name string) {
 		Target:   ".",
 		Value: []dns.SVCBKeyValue{
 			&dns.SVCBECHConfig{ECH: echConfig},
-			&dns.SVCBAlpn{Alpn: []string{"h2", "http/1.1"}},
+			// ⚠️ 只留 http/1.1：xprobe CLI 实测 HTTP/1.1+ECH→200，
+			// Firefox 用 h2+ECH 页面失败（CF 边缘 ECH+h2 组合异常）。
+			&dns.SVCBAlpn{Alpn: []string{"http/1.1"}},
 		},
 	}
 	if len(hintIPs) > 0 {
