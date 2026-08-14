@@ -37,6 +37,7 @@ jobs:
         run: |
           unzip -o android-xprobe/app/libs/echproxy.aar classes.jar -d /tmp/aarx > /dev/null
           unzip -l /tmp/aarx/classes.jar | grep -i ech | head -20
+          cd /tmp/aarx && javap -classpath classes.jar com.anglesgirl.xprobe.golib.echproxy.Echproxy 2>&1 | head -20
 
       - uses: actions/setup-java@v4
         with:
