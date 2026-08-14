@@ -86,7 +86,8 @@ class MainActivity : ComponentActivity() {
                 val output = withContext(Dispatchers.IO) {
                     try {
                         // gomobile: javapkg + Go包名(echproxy) + 类名(Echproxy)
-                        com.anglesgirl.xprobe.golib.echproxy.Echproxy.XProbe(doh, hosts)
+                        // 方法名 Java 驼峰化：XProbe → xProbe
+                        com.anglesgirl.xprobe.golib.echproxy.Echproxy.xProbe(doh, hosts)
                     } catch (e: Throwable) {
                         "调用失败: ${e.message}\n${e.stackTraceToString()}"
                     }
