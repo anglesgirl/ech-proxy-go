@@ -56,6 +56,7 @@ class MainActivity : AppCompatActivity() {
 
         // 先启动本地 DoH（异步），再初始化 GeckoView
         startEchDoh()
+        checkDns()
         try {
             startGecko()
             EchApp.log("APP", "GeckoView started OK")
@@ -74,20 +75,42 @@ class MainActivity : AppCompatActivity() {
                 val cert = assets.open("doh-fullchain.pem").bufferedReader().readText()
                 val key = assets.open("doh-key.pem").bufferedReader().readText()
                 EchApp.log("DOH", "cert ${cert.length}B key ${key.length}B loaded")
-                val err = com.anglesgirl.echbrowser.echdoh.Echdoh.start(
-                    "127.0.0.1:$DOH_PORT", cert, key,
-                    "https://pieqllv9i7.cloudflare-gateway.com/dns-query,https://162.159.36.5/dns-query"
-                )
-                if (err != null) {
-                    EchApp.log("DOH", "start failed: $err")
-                } else {
-                    EchApp.log("DOH", "ech-doh listening on $DOH_PORT (cert: $DOH_DOMAIN)")
+                // gomobile: 返回 error 的函数,成功=void,失败=抛异常(不是返回 null)
+                try {
+                    com.anglesgirl.echbrowser.echdoh.Echdoh.start(
+                        "127.0.0.1:$DOH_PORT", cert, key,
+                        "https://pieqllv9i7.cloudflare-gateway.com/dns-query,https://162.159.36.5/dns-query"
+                    )
+                    EchApp.log("DOH", "start() returned (no exception)")
+                } catch (e: Throwable) {
+                    EchApp.log("DOH", "start() threw: ${e.message}")
+                }
+                // 健康检查: 等服务起来后测 TCP 端口
+                Thread.sleep(800)
+                try {
+                    val s = java.net.Socket("127.0.0.1", DOH_PORT.toInt())
+                    s.close()
+                    EchApp.log("DOH", "health check: port $DOH_PORT OPEN ✓")
+                } catch (e: Throwable) {
+                    EchApp.log("DOH", "health check: port $DOH_PORT CLOSED ✗ ($e)")
                 }
             } catch (e: Throwable) {
                 EchApp.log("DOH", "start exception: ${e.message}")
                 EchApp.crash(Thread.currentThread(), e)
             }
         }.apply { name = "echdoh-start"; start() }
+    }
+
+    /** DNS 自检: 手机上 doh.anglesgirl.eu.org 解析成什么。 */
+    private fun checkDns() {
+        Thread {
+            try {
+                val addrs = java.net.InetAddress.getAllByName(DOH_DOMAIN)
+                EchApp.log("DNS", "$DOH_DOMAIN -> ${addrs.joinToString { it.hostAddress }}")
+            } catch (e: Throwable) {
+                EchApp.log("DNS", "resolve $DOH_DOMAIN FAILED: ${e.message}")
+            }
+        }.apply { name = "dns-check"; start() }
     }
 
     private fun buildUi() {
@@ -176,6 +199,17 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStop(s: GeckoSession, success: Boolean) {
                 EchApp.log("PAGE", "stop success=$success")
                 setStatus(if (success) "✅ 加载完成" else "❌ 加载失败")
+            }
+
+            override fun onLoadError(
+                s: GeckoSession,
+                uri: String?,
+                error: Int,
+                errorClass: Int
+            ): org.mozilla.geckoview.GeckoResult<Boolean>? {
+                // 错误码: ERROR_UNKNOWN_HOST=-4, ERROR_SECURITY_SSL=-5, ERROR_NET_TIMEOUT=-10 等
+                EchApp.log("GECKO", "loadError uri=$uri error=$error class=$errorClass")
+                return null // 不处理,让 GeckoView 显示错误页
             }
 
             override fun onSecurityChange(
