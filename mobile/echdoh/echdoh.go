@@ -284,6 +284,11 @@ func injectECH(resp *dns.Msg, name string) {
 		return
 	}
 
+	// 注入 ipv4hint=DoH 端点 IP：目标域自己的 A 记录（如 x.com 172.66.0.227）
+	// 在大陆可能被墙，而 DoH 端点 IP（162.159.36.x）实测可达。RFC 9460
+	// 规定客户端优先用 SVCB 的 ipv4hint 连接，从而绕开被墙边缘。
+	hintIPs := fetchDohEndpointIPv4s()
+
 	svcb := &dns.SVCB{
 		Hdr: dns.RR_Header{
 			Name:   name,
@@ -298,9 +303,63 @@ func injectECH(resp *dns.Msg, name string) {
 			&dns.SVCBAlpn{Alpn: []string{"h2", "http/1.1"}},
 		},
 	}
+	if len(hintIPs) > 0 {
+		hints := make([]net.IP, 0, len(hintIPs))
+		for _, h := range hintIPs {
+			if ip := net.ParseIP(h); ip != nil {
+				hints = append(hints, ip)
+			}
+		}
+		if len(hints) > 0 {
+			svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: hints})
+		}
+	}
 	resp.Answer = append(resp.Answer, svcb)
 	resp.Authoritative = true
-	log.Printf("[doh] injected ech= into HTTPS record for %s (%d bytes)", name, len(echConfig))
+	log.Printf("[doh] injected ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
+}
+
+// fetchDohEndpointIPv4s 解析 DoH 端点域名（如 pieqllv9i7.cloudflare-gateway.com）
+// 的 IPv4，作为注入记录的 ipv4hint。这些 IP 是 CF 边缘，实测大陆可达。
+// 解析失败时用内置快照兜底（同一批网关的已知 IP）。
+func fetchDohEndpointIPv4s() []string {
+	var ips []string
+	seen := map[string]bool{}
+	add := func(ip string) {
+		ip = strings.TrimSpace(ip)
+		if ip != "" && !seen[ip] {
+			seen[ip] = true
+			ips = append(ips, ip)
+		}
+	}
+
+	// 从 upstream DoH 域名解析 A 记录
+	for _, u := range upstream {
+		host := strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
+		if i := strings.Index(host, "/"); i >= 0 {
+			host = host[:i]
+		}
+		if net.ParseIP(host) != nil {
+			continue // 已经是 IP 直连（如 162.159.36.5）
+		}
+		q := new(dns.Msg)
+		q.SetQuestion(dns.Fqdn(host), dns.TypeA)
+		resp, err := queryUpstream(q)
+		if err != nil {
+			continue
+		}
+		for _, rr := range resp.Answer {
+			if a, ok := rr.(*dns.A); ok {
+				add(a.A.String())
+			}
+		}
+	}
+
+	// 内置快照兜底（pieqllv9i7.cloudflare-gateway.com 已知 IP）
+	for _, ip := range []string{"162.159.36.5", "162.159.36.20"} {
+		add(ip)
+	}
+	return ips
 }
 
 // fetchCFPublicECH 获取 Cloudflare 公共 ECH 公钥（cloudflare-ech.com HTTPS ech=）。
