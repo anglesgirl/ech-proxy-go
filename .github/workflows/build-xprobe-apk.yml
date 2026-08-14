@@ -1,0 +1,52 @@
+name: Build x.com ECH Probe APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android-xprobe/**'
+      - 'mobile/echproxy/**'
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;27.0.12077973'
+
+      - name: Install gomobile
+        run: go install golang.org/x/mobile/cmd/gomobile@latest
+
+      - name: Initialize gomobile
+        run: gomobile init
+
+      - name: Build Go AAR
+        run: |
+          gomobile bind -target=android -androidapi 27 -o android-xprobe/app/libs/echproxy.aar ./mobile/echproxy
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build APK
+        run: |
+          cd android-xprobe
+          gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xprobe-apk
+          path: android-xprobe/app/build/outputs/apk/debug/*.apk
