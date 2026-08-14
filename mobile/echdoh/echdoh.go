@@ -29,32 +29,39 @@ import (
 )
 
 var (
-	mu        sync.Mutex
-	srv       *http.Server
-	running   bool
-	upstream  []string
-	lastErr   string
-	logSink   func(string)
-	logSinkMu sync.Mutex
+	mu       sync.Mutex
+	srv      *http.Server
+	running  bool
+	upstream []string
+	lastErr  string
+	logBuf   []string // Go 侧日志缓冲（Kotlin 轮询拉取）
+	logBufMu sync.Mutex
+	logPos   int
 )
 
-// SetLogSink 注册日志回调。Go 侧所有 [doh] 日志会同时推给 sink
-// （Android 端写入 echbrowser.log），便于诊断。传 nil 取消。
-func SetLogSink(fn func(string)) {
-	logSinkMu.Lock()
-	logSink = fn
-	logSinkMu.Unlock()
+// PollLogs 增量返回 Go 侧日志（Kotlin 定时轮询写入 echbrowser.log）。
+// gomobile 不支持导出 func 参数回调，用轮询替代。
+func PollLogs() string {
+	logBufMu.Lock()
+	defer logBufMu.Unlock()
+	if logPos >= len(logBuf) {
+		return ""
+	}
+	out := ""
+	for i := logPos; i < len(logBuf); i++ {
+		out += logBuf[i] + "\n"
+	}
+	logPos = len(logBuf)
+	return out
 }
 
-// slog 带 sink 的日志：既写 stderr（logcat），也推给 Android 日志文件。
+// slog 带缓冲的日志：既写 stderr（logcat），也进缓冲供 Kotlin 拉取。
 func slog(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("[doh] %s", msg)
-	logSinkMu.Lock()
-	if logSink != nil {
-		logSink(msg)
-	}
-	logSinkMu.Unlock()
+	logBufMu.Lock()
+	logBuf = append(logBuf, msg)
+	logBufMu.Unlock()
 }
 
 // Start 启动本地 DoH 注入服务器（127.0.0.1:listen）。
@@ -214,7 +221,9 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	// AAAA 清空：CF 托管站点强制 IPv4（DoH 端点 IP），避免 Firefox
 	// 优先 IPv6 超时。非 CF 站点原样保留。
 	if q.Qtype == dns.TypeAAAA {
-		rewriteAAAAEmpty(resp, q.Name)
+		if isCloudflareHosted(q.Name) {
+			rewriteAAAAEmpty(resp, q.Name)
+		}
 	}
 
 	slog("%s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
@@ -290,13 +299,13 @@ func svcbValues(rr dns.RR) []dns.SVCBKeyValue {
 
 // injectECH 无条件注入 CF 公共 ECH 公钥。
 //
-// 策略（用户拍板，2026-08-14）：不做 AS13335 过滤，所有域名都注入。
+// 策略（2026-08-14 修正）：只给 CF 托管域名（跟随 CNAME 链判断）注入。
 // 理由：
-//  1. 强制注入 CF 公共公钥对任何站点无害——Firefox 原生 ECH 失败时
-//     自动回退普通 TLS（RFC 8446 标准行为），非 CF 站点不受影响；
-//  2. CF 托管的被墙站（x.com 等）正是靠这个隐藏 SNI；
-//  3. CNAME 链末尾是 CF 的站点（如 video.twimg.com → .cdn.cloudflare.net）
-//     也一并覆盖，无需逐一判断。
+//  1. CF 托管被墙站（x.com 等）靠注入隐藏 SNI —— 必须注入；
+//  2. Fastly 托管（abs/cdn.syndication.twimg.com 等 CSS/JS 资源）**不能注入**：
+//     Fastly 不认 CF 公共公钥 → ECH 握手失败 → Firefox 降级明文并缓存 24h
+//     → 该域名整个废掉（用户实测页面 CSS 全丢）；
+//  3. 非 CF 站点（baidu 等）同样不注入，避免多余 ECH 尝试。
 func injectECH(resp *dns.Msg, name string) {
 	name = dns.Fqdn(name)
 
@@ -307,6 +316,12 @@ func injectECH(resp *dns.Msg, name string) {
 				return
 			}
 		}
+	}
+
+	// 只给 CF 托管域名注入（跟随 CNAME 链判断，同 rewriteAIfCF）
+	if !isCloudflareHosted(name) {
+		slog("%s: not CF-hosted, skip inject", name)
+		return
 	}
 
 	// 获取 CF 公共 ECH 公钥
@@ -351,6 +366,38 @@ func injectECH(resp *dns.Msg, name string) {
 	resp.Answer = append(resp.Answer, svcb)
 	resp.Authoritative = true
 	slog("injected ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
+}
+
+// isCloudflareHosted 跟随 CNAME 链（≤5 跳）查询目标 A 记录，判断是否
+// 全部为 CF 边缘（AS13335）。用于 injectECH 决定是否注入（Fastly 等
+// 非 CF 域名不注入，避免 ECH 失败降级明文缓存 24h）。
+func isCloudflareHosted(name string) bool {
+	cur := dns.Fqdn(name)
+	for hop := 0; hop < 5; hop++ {
+		q := new(dns.Msg)
+		q.SetQuestion(cur, dns.TypeA)
+		r, err := queryUpstream(q)
+		if err != nil {
+			return false
+		}
+		var ips []string
+		cur = ""
+		for _, rr := range r.Answer {
+			switch v := rr.(type) {
+			case *dns.A:
+				ips = append(ips, v.A.String())
+			case *dns.CNAME:
+				cur = dns.Fqdn(v.Target)
+			}
+		}
+		if len(ips) > 0 {
+			return cloudflare.AllAS13335(ips)
+		}
+		if cur == "" {
+			return false
+		}
+	}
+	return false
 }
 
 // rewriteAIfCF 若目标域名（跟随 CNAME 链）最终解析到 CF 边缘（AS13335），

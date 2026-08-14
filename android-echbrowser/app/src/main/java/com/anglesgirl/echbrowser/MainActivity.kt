@@ -50,7 +50,26 @@ class MainActivity : AppCompatActivity() {
         buildUi()
         log("APP", "UI built")
         startEchDoh()
+        startGoLogPoller()
         startGecko()
+    }
+
+    /** 轮询 Go 侧 DoH 日志（注入/改写过程），写入 echbrowser.log。 */
+    private fun startGoLogPoller() {
+        Thread {
+            while (!isFinishing) {
+                try {
+                    val logs = com.anglesgirl.echbrowser.echdoh.Echdoh.pollLogs()
+                    if (logs.isNotEmpty()) {
+                        for (line in logs.split("\n")) {
+                            if (line.isNotBlank()) log("DOH", line)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+                Thread.sleep(1000)
+            }
+        }.apply { name = "golog"; start() }
     }
 
     private fun buildUi() {
@@ -109,10 +128,6 @@ class MainActivity : AppCompatActivity() {
     private fun startEchDoh() {
         Thread {
             try {
-                // Go 侧日志回调 → 写入 echbrowser.log（诊断关键）
-                com.anglesgirl.echbrowser.echdoh.Echdoh.setLogSink { msg ->
-                    log("DOH", msg)
-                }
                 log("DOH", "reading certs...")
                 val cert = assets.open("doh-fullchain.pem").bufferedReader().readText()
                 val key = assets.open("doh-key.pem").bufferedReader().readText()
