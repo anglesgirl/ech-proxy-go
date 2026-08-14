@@ -85,8 +85,8 @@ class MainActivity : ComponentActivity() {
             scope.launch {
                 val output = withContext(Dispatchers.IO) {
                     try {
-                        // gomobile 绑定：javapkg com.anglesgirl.xprobe.golib，类 Echproxy
-                        com.anglesgirl.xprobe.golib.Echproxy.XProbe(doh, hosts)
+                        // gomobile: javapkg + Go包名(echproxy) + 类名(Echproxy)
+                        com.anglesgirl.xprobe.golib.echproxy.Echproxy.XProbe(doh, hosts)
                     } catch (e: Throwable) {
                         "调用失败: ${e.message}\n${e.stackTraceToString()}"
                     }
