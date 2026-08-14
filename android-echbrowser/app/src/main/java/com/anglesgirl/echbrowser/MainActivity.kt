@@ -185,6 +185,14 @@ class MainActivity : AppCompatActivity() {
                     return null
                 }
 
+                override fun onResponseReceived(
+                    s: GeckoSession,
+                    response: org.mozilla.geckoview.GeckoSession.NavigationDelegate.WebResponseInfo
+                ) {
+                    // HTTP 状态码 + 内容类型：判断是 403 拦截还是 200 正常
+                    log("HTTP", "resp uri=${response.uri} status=${response.statusCode} type=${response.contentType}")
+                }
+
                 override fun onCanGoBack(s: GeckoSession, canGoBack: Boolean) {}
                 override fun onCanGoForward(s: GeckoSession, canGoForward: Boolean) {}
             }
