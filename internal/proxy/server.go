@@ -231,6 +231,17 @@ func (s *Server) SetEndpoints(doh, ip string) {
 	}
 }
 
+// SetPreferredIPs 将测速优选的 IP 前置到候选最前（不丢现有 custom IPs：
+// 远程配置 IP / DoH 端点 IP 保留在优选 IP 之后）。移动宽带下优选 IP
+// 是实测最快的边缘，优先尝试可避免串行试不可达 IP 白等。
+func (s *Server) SetPreferredIPs(ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+	s.dialer.PrependCustomIPs(ips)
+	log.Printf("[proxy] preferred IPs prepended: %v", ips)
+}
+
 // SetOverrides hot-updates per-host fixed IP lists (seed TXT `override=`)
 // field). Hosts listed bypass DoH A/AAAA and dial with plain TLS only.
 func (s *Server) SetOverrides(spec string) {

@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/anglesgirl/ech-proxy-go/internal/config"
 	"github.com/anglesgirl/ech-proxy-go/internal/proxy"
 )
@@ -157,6 +158,21 @@ func Start(listen, doh, cachePath string, noDowngrade bool) error {
 			}
 		}()
 		lastInfo = "listening on " + listen
+		// 2026-08-15 CF IP 优选：启动后后台扫最快边缘 IP（拉白嫖优选列表 +
+		// TLS 握手测速），完成后前置到候选最前。不阻塞启动 —— 首个请求
+		// 用现有候选（远程配置/DoH 端点 IP），扫描完成自动切换最快 IP。
+		// 移动宽带上避免串行试不可达 IP 白等（CO3 实测每次卡 40s+）。
+		go func() {
+			start := time.Now()
+			ips := cloudflare.ScanPreferredIPs(5, 8*time.Second)
+			if len(ips) == 0 {
+				log.Printf("[echproxy] preferred IP scan: no reachable IP (took %v)", time.Since(start))
+				return
+			}
+			s.SetPreferredIPs(ips)
+			log.Printf("[echproxy] preferred IP scan: %d fastest IPs %v (took %v)",
+				len(ips), ips, time.Since(start))
+		}()
 		return nil
 	})
 }

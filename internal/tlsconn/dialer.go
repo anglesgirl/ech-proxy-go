@@ -87,6 +87,32 @@ func (d *Dialer) AppendCustomIPs(ips []string) {
 	}
 }
 
+// PrependCustomIPs puts speed-scanned preferred IPs at the FRONT of the
+// candidate list (they won the network speed test, so they're tried first).
+// Existing custom IPs (remote config / DoH endpoint) are kept after them.
+func (d *Dialer) PrependCustomIPs(ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(d.customIPs)+len(ips))
+	var fresh []string
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || seen[ip] || !cloudflare.IsAS13335(ip) {
+			continue
+		}
+		seen[ip] = true
+		fresh = append(fresh, ip)
+	}
+	for _, ip := range d.customIPs {
+		if !seen[ip] {
+			seen[ip] = true
+			fresh = append(fresh, ip)
+		}
+	}
+	d.customIPs = fresh
+}
+
 // DialECH establishes an ECH TLS connection to hostname using DNS results.
 func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) {
 	if len(result.IPs) == 0 {
