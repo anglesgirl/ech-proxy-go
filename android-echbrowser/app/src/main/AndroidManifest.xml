@@ -4,6 +4,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
+        android:name=".EchApp"
         android:allowBackup="true"
         android:label="ECH 浏览器"
         android:supportsRtl="true"

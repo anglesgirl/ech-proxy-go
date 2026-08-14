@@ -8,10 +8,10 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
-import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -20,22 +20,9 @@ import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.concurrent.Executors
 
 /**
  * ECH 浏览器 Demo —— GeckoView（Firefox 内核）+ 本地 DoH 注入 ECH。
- *
- * 原理：
- *   1. App 内嵌 ech-doh Go 服务（127.0.0.1:8443 HTTPS DoH），启动时拉起
- *   2. 证书：doh.anglesgirl.eu.org 的 Let's Encrypt 合法证书（内嵌 assets）
- *   3. DNS：doh.anglesgirl.eu.org → 127.0.0.1（CF 托管，全球生效）
- *   4. GeckoView TRR mode=3 指向 https://doh.anglesgirl.eu.org:8443/dns-query
- *   5. 本地 DoH 对所有域名注入 CF 公共 ECH 公钥 → Firefox 原生 ECH 启用
- *      → SNI 隐藏 → 被墙站点（x.com 等）直接访问
  */
 class MainActivity : AppCompatActivity() {
 
@@ -43,9 +30,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var session: GeckoSession
     private lateinit var address: EditText
     private lateinit var status: TextView
-    private val io = Executors.newSingleThreadExecutor()
-    private val logFile by lazy { File(filesDir, "echbrowser.log") }
-    private val ts get() = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
 
     private val DOH_DOMAIN = "doh.anglesgirl.eu.org"
     private val DOH_PORT = "8443"
@@ -53,32 +37,50 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
-        window.statusBarColor = Color.rgb(16, 20, 40)
-        buildUi()
-        log("APP", "onCreate; starting ech-doh + GeckoView")
+        EchApp.log("APP", "MainActivity.onCreate start")
+        try {
+            window.statusBarColor = Color.rgb(16, 20, 40)
+            buildUi()
+            EchApp.log("APP", "UI built")
+        } catch (e: Throwable) {
+            EchApp.log("APP", "buildUi FAILED: $e")
+            EchApp.crash(Thread.currentThread(), e)
+        }
+
+        // 先启动本地 DoH（异步），再初始化 GeckoView
         startEchDoh()
-        startGecko()
+        try {
+            startGecko()
+            EchApp.log("APP", "GeckoView started OK")
+        } catch (e: Throwable) {
+            EchApp.log("APP", "startGecko FAILED: $e")
+            EchApp.crash(Thread.currentThread(), e)
+            setStatus("❌ GeckoView 初始化失败: ${e.message}")
+        }
     }
 
-    /** 从 assets 读取内嵌证书，启动 Go DoH 注入服务。 */
+    /** 启动 Go DoH 注入服务。 */
     private fun startEchDoh() {
-        io.execute {
+        Thread {
             try {
+                EchApp.log("DOH", "reading certs from assets...")
                 val cert = assets.open("doh-fullchain.pem").bufferedReader().readText()
                 val key = assets.open("doh-key.pem").bufferedReader().readText()
+                EchApp.log("DOH", "cert ${cert.length}B key ${key.length}B loaded")
                 val err = com.anglesgirl.echbrowser.echdoh.Echdoh.start(
                     "127.0.0.1:$DOH_PORT", cert, key,
                     "https://pieqllv9i7.cloudflare-gateway.com/dns-query,https://162.159.36.5/dns-query"
                 )
                 if (err != null) {
-                    log("DOH", "start failed: $err")
+                    EchApp.log("DOH", "start failed: $err")
                 } else {
-                    log("DOH", "ech-doh listening on $DOH_PORT (cert: $DOH_DOMAIN)")
+                    EchApp.log("DOH", "ech-doh listening on $DOH_PORT (cert: $DOH_DOMAIN)")
                 }
             } catch (e: Throwable) {
-                log("DOH", "start exception: ${e.message}")
+                EchApp.log("DOH", "start exception: ${e.message}")
+                EchApp.crash(Thread.currentThread(), e)
             }
-        }
+        }.apply { name = "echdoh-start"; start() }
     }
 
     private fun buildUi() {
@@ -124,17 +126,21 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
-    /** GeckoView 初始化：TRR 指向本地 DoH（注入 ECH 的关键）。 */
+    /** GeckoView 初始化：TRR 指向本地 DoH。 */
     @SuppressLint("WrongThread")
     private fun startGecko() {
+        EchApp.log("GECKO", "building runtime settings...")
         val settings = GeckoRuntimeSettings.Builder()
             .javaScriptEnabled(true)
-            // 仅用 DoH（TRR_MODE_ONLY），指向本地注入服务器
             .trustedRecursiveResolverMode(GeckoRuntimeSettings.TRR_MODE_ONLY)
             .trustedRecursiveResolverUri(DOH_URL)
             .build()
+        EchApp.log("GECKO", "runtime settings built, creating runtime...")
+
         val runtime = GeckoRuntime.create(this, settings)
+        EchApp.log("GECKO", "runtime created: ${runtime.javaClass.name}")
         session = GeckoSession()
+        EchApp.log("GECKO", "session created")
 
         session.navigationDelegate = object : GeckoSession.NavigationDelegate {
             override fun onLocationChange(
@@ -143,7 +149,7 @@ class MainActivity : AppCompatActivity() {
                 permissions: List<GeckoSession.PermissionDelegate.ContentPermission>,
                 hasUserGesture: Boolean
             ) {
-                log("NAV", "location=$url")
+                EchApp.log("NAV", "location=$url")
                 runOnUiThread {
                     address.setText(url ?: "")
                     status.text = "地址: ${url ?: ""}"
@@ -156,12 +162,12 @@ class MainActivity : AppCompatActivity() {
 
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(s: GeckoSession, url: String) {
-                log("PAGE", "start=$url")
+                EchApp.log("PAGE", "start=$url")
                 setStatus("加载中...")
             }
 
             override fun onPageStop(s: GeckoSession, success: Boolean) {
-                log("PAGE", "stop success=$success")
+                EchApp.log("PAGE", "stop success=$success")
                 setStatus(if (success) "✅ 加载完成" else "❌ 加载失败")
             }
 
@@ -169,53 +175,46 @@ class MainActivity : AppCompatActivity() {
                 s: GeckoSession,
                 info: GeckoSession.ProgressDelegate.SecurityInformation
             ) {
-                log("TLS", "security=${info.origin} secure=${info.isSecure}")
+                EchApp.log("TLS", "security=${info.origin} secure=${info.isSecure}")
             }
         }
 
+        EchApp.log("GECKO", "opening session...")
         session.open(runtime)
+        EchApp.log("GECKO", "session opened, setting view...")
         geckoView.setSession(session)
         setStatus("ech-doh + GeckoView 就绪")
+        EchApp.log("GECKO", "view set, loading...")
         load()
     }
 
     private fun load() {
         val raw = address.text.toString().trim()
         val url = if (raw.startsWith("http")) raw else "https://$raw"
-        log("USER", "load=$url")
-        session.loadUri(url)
+        EchApp.log("USER", "load=$url")
+        try {
+            session.loadUri(url)
+            EchApp.log("USER", "loadUri called OK")
+        } catch (e: Throwable) {
+            EchApp.log("USER", "loadUri FAILED: $e")
+        }
     }
 
     private fun setStatus(s: String) {
         runOnUiThread { status.text = s }
     }
 
-    private fun log(tag: String, msg: String) {
-        val line = "$ts [$tag] $msg\n"
-        io.execute {
-            try {
-                logFile.parentFile?.mkdirs()
-                logFile.appendText(line)
-            } catch (_: Throwable) {}
-        }
-        android.util.Log.i("EchBrowser", line.trim())
-    }
-
     private fun showLogs() {
-        val text = if (logFile.exists()) logFile.readText() else "暂无日志"
+        val text = if (EchApp.logFile.exists()) EchApp.logFile.readText() else "暂无日志"
         val view = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 11f
             setPadding(20, 10, 20, 10)
             this.text = text
         }
-        ScrollableDialog(this, view, "ECH 浏览器日志")
-    }
-
-    private fun ScrollableDialog(ctx: AppCompatActivity, view: TextView, title: String) {
-        val sv = android.widget.ScrollView(ctx).apply { addView(view) }
-        AlertDialog.Builder(ctx)
-            .setTitle(title)
+        val sv = ScrollView(this).apply { addView(view) }
+        AlertDialog.Builder(this)
+            .setTitle("ECH 浏览器日志")
             .setView(sv)
             .setPositiveButton("关闭", null)
             .setNeutralButton("导出") { _, _ -> exportLogs() }
@@ -223,23 +222,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun exportLogs() {
-        if (!logFile.exists()) {
+        if (!EchApp.logFile.exists()) {
             Toast.makeText(this, "暂无日志", Toast.LENGTH_SHORT).show()
             return
         }
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", logFile)
-        val i = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            clipData = ClipData.newRawUri("日志", uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", EchApp.logFile)
+            val i = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                clipData = ClipData.newRawUri("日志", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(i, "导出 ECH 浏览器日志"))
+        } catch (e: Throwable) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_LONG).show()
         }
-        startActivity(Intent.createChooser(i, "导出 ECH 浏览器日志"))
     }
 
     override fun onDestroy() {
-        log("APP", "onDestroy")
-        io.shutdown()
+        EchApp.log("APP", "onDestroy")
         try {
             session.close()
             com.anglesgirl.echbrowser.echdoh.Echdoh.stop()
