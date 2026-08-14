@@ -52,7 +52,7 @@ func main() {
 	doh := flag.String("doh", "https://pieqllv9i7.cloudflare-gateway.com/dns-query", "DoH endpoint")
 	hostsFlag := flag.String("hosts", "", "comma-separated hosts (default: x.com family)")
 	path := flag.String("path", "/", "request path")
-	timeout := flag.Duration("timeout", 20*time.Second, "per-host timeout")
+	timeout := flag.Duration("timeout", 8*time.Second, "per-candidate timeout")
 	noDowngrade := flag.Bool("no-downgrade", true, "never fall back to plain TLS (default true = 强制 ECH)")
 	customIPs := flag.String("ip", "", "comma-separated CF edge IPs to force (optional)")
 	flag.Parse()
@@ -229,33 +229,40 @@ func truncStr(s string, n int) string {
 	return s
 }
 
-// resolveDoHHostIPs 解析 DoH 端点域名 IP（系统 DNS 可用时用，失败用内置快照）
+// resolveDoHHostIPs 解析 DoH 端点域名 IP（系统 DNS 可用时用，失败用内置快照）。
+// ⚠️ IPv4 强制优先：实测（2026-08-14）CF IPv4 边缘 ECH→200，IPv6 边缘→403。
 func resolveDoHHostIPs(dohURL string) []string {
 	host := strings.TrimPrefix(strings.TrimPrefix(dohURL, "https://"), "http://")
 	if i := strings.Index(host, "/"); i > 0 {
 		host = host[:i]
 	}
-	var ips []string
+	var v4, v6 []string
 	if addrs, err := net.LookupHost(host); err == nil {
 		for _, a := range addrs {
-			if net.ParseIP(a) != nil {
-				ips = append(ips, a)
+			ip := net.ParseIP(a)
+			if ip == nil {
+				continue
+			}
+			if ip.To4() != nil {
+				v4 = append(v4, a)
+			} else {
+				v6 = append(v6, a)
 			}
 		}
 	}
 	for _, b := range []string{"162.159.36.5", "162.159.36.20"} {
 		found := false
-		for _, a := range ips {
+		for _, a := range v4 {
 			if a == b {
 				found = true
 				break
 			}
 		}
 		if !found {
-			ips = append(ips, b)
+			v4 = append(v4, b)
 		}
 	}
-	return ips
+	return append(v4, v6...)
 }
 
 var _ = os.Exit

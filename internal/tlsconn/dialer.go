@@ -19,10 +19,10 @@ import (
 	"sync"
 	"time"
 
+	"crypto/tls"
 	"github.com/anglesgirl/ech-proxy-go/internal/certutil"
 	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/anglesgirl/ech-proxy-go/internal/dns"
-	"crypto/tls"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -93,14 +93,19 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 		return nil, fmt.Errorf("no IP for %s", hostname)
 	}
 
-	// Build candidate address list: DoH-resolved IPs first, then custom IPs.
+	// Build candidate address list: custom IPs (operator-verified edge,
+	// e.g. DoH endpoint IPs known to be reachable) first, then DoH-resolved
+	// IPs. Custom-first matters on restricted networks: DoH-resolved edge
+	// IPs of the target may be blocked (GFW), while the DoH endpoint's own
+	// AS13335 IP is by definition reachable — trying it first avoids
+	// multi-second timeouts on blocked candidates.
 	port := "443"
 	var candidates []string
-	for _, ip := range result.IPs {
-		candidates = append(candidates, net.JoinHostPort(ip.String(), port))
-	}
 	for _, ip := range d.customIPs {
 		candidates = append(candidates, net.JoinHostPort(ip, port))
+	}
+	for _, ip := range result.IPs {
+		candidates = append(candidates, net.JoinHostPort(ip.String(), port))
 	}
 
 	tlsConfig := &utls.Config{

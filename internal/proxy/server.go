@@ -24,10 +24,10 @@ import (
 
 // Server is the proxy server.
 type Server struct {
-	cfg           *config.Config
-	resolver      *dns.Resolver
-	dialer        *tlsconn.Dialer
-	server        *http.Server
+	cfg      *config.Config
+	resolver *dns.Resolver
+	dialer   *tlsconn.Dialer
+	server   *http.Server
 	// appLayerClient 处理应用层转发(X-Ech-Target 模式):OkHttp 发来明文
 	// HTTP 请求 + X-Ech-Target 头,代理用 ECH 连上游、返回明文响应。
 	// 与 CONNECT 隧道不同:客户端不需要自己再 TLS 握手。
@@ -45,6 +45,8 @@ var builtinDoHHostIPs = []string{"162.159.36.5", "162.159.36.20"}
 
 // resolveDoHHostIPs 解析 DoH 端点域名(如 pieqllv9i7.cloudflare-gateway.com)
 // 的 IP 列表,用于自动并入 ECH 握手候选。系统 DNS 解析失败时回退内置快照。
+// ⚠️ IPv4 强制优先（2026-08-14 实测）: 同一 ECH 请求连 CF IPv4 边缘 → 200,
+// 连 CF IPv6 边缘 → 403(bot 判定不同, IPv6 节点信誉低)。IPv6 仅作最后兜底。
 func resolveDoHHostIPs(dohURL string) []string {
 	u, err := url.Parse(dohURL)
 	if err != nil || u.Hostname() == "" {
@@ -53,28 +55,34 @@ func resolveDoHHostIPs(dohURL string) []string {
 	host := u.Hostname()
 
 	// 1. 系统 DNS 解析(DoH 端点域名一般未被污染)。
-	var ips []string
+	var v4, v6 []string
 	if addrs, err := net.LookupHost(host); err == nil {
 		for _, a := range addrs {
-			if net.ParseIP(a) != nil {
-				ips = append(ips, a)
+			ip := net.ParseIP(a)
+			if ip == nil {
+				continue
+			}
+			if ip.To4() != nil {
+				v4 = append(v4, a)
+			} else {
+				v6 = append(v6, a)
 			}
 		}
 	}
 	// 2. 内置快照兜底。
 	for _, b := range builtinDoHHostIPs {
 		found := false
-		for _, a := range ips {
+		for _, a := range v4 {
 			if a == b {
 				found = true
 				break
 			}
 		}
 		if !found {
-			ips = append(ips, b)
+			v4 = append(v4, b)
 		}
 	}
-	return ips
+	return append(v4, v6...)
 }
 
 // New creates a proxy server from configuration.
@@ -331,6 +339,25 @@ func (s *Server) handleAppLayer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	req.Host = target
+	// 应用层域名改写: WebView/App 的请求 URL 是 127.0.0.1(本地代理地址),
+	// Referer/Origin 头泄漏非官方域名 → AO3 服务端拒绝登录(auth_error,
+	// 2026-08-13 playwright 实测: 表单提交 Referer=http://127.0.0.1:PORT)。
+	// ECH 只保护网络层(TLS 隐藏 SNI),应用层来源必须与真实一致——重写为
+	// 官方域名,服务端看到的来源与直连官方完全相同。
+	if v := req.Header.Get("Referer"); v != "" {
+		if u, err := url.Parse(v); err == nil && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost") {
+			u.Scheme = "https"
+			u.Host = target
+			req.Header.Set("Referer", u.String())
+		}
+	}
+	if v := req.Header.Get("Origin"); v != "" {
+		if u, err := url.Parse(v); err == nil && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost") {
+			u.Scheme = "https"
+			u.Host = target
+			req.Header.Set("Origin", u.String())
+		}
+	}
 	req.Header.Del("Accept-Encoding")
 
 	resp, err := s.appLayerClient.Do(req)

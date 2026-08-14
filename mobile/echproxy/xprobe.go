@@ -54,7 +54,8 @@ func xprobeRun(doh, hosts string) string {
 	log.Printf("[xprobe] DoH: %s 时间: %s", doh, time.Now().Format("15:04:05"))
 
 	resolver := dns.New(doh, 10*time.Second, 300*time.Second)
-	dialer := tlsconn.New(20*time.Second, false, false) // fallbackPlain=false → 强制 ECH
+	// 单候选超时 8s：custom IP（DoH 端点）优先可达，被墙候选快速跳过
+	dialer := tlsconn.New(8*time.Second, false, false) // fallbackPlain=false → 强制 ECH
 	// 自动并入 DoH 端点 IP（CF 边缘，目标 IP 被封时兜底）
 	if ips := xResolveDoHHostIPs(doh); len(ips) > 0 {
 		dialer.AppendCustomIPs(ips)
@@ -139,7 +140,7 @@ func xTestHost(resolver *dns.Resolver, dialer *tlsconn.Dialer, host string) (str
 	}
 
 	// 4. 复用 TLS 连接发 HTTPS 请求
-	statusCode, respLen, bodyPreview, err := xRequest(conn, host, "/", 20*time.Second)
+	statusCode, respLen, bodyPreview, err := xRequest(conn, host, "/", 8*time.Second)
 	if err != nil {
 		return fmt.Sprintf("%s %s %s %-6s %-8s %s\n",
 			pad(host), pad(ipStr), pad(echAccepted), "-", time.Since(start).Round(time.Millisecond),
@@ -215,32 +216,40 @@ func xRequest(conn net.Conn, host, path string, timeout time.Duration) (int, int
 }
 
 // xResolveDoHHostIPs 解析 DoH 端点域名 IP（系统 DNS 可用时用，失败用内置快照）。
+// ⚠️ IPv4 强制优先：实测（2026-08-14）同一 ECH 请求连 CF IPv4 边缘 → 200，
+// 连 CF IPv6 边缘 → 403（bot 判定不同）。IPv6 仅作最后兜底。
 func xResolveDoHHostIPs(dohURL string) []string {
 	host := strings.TrimPrefix(strings.TrimPrefix(dohURL, "https://"), "http://")
 	if i := strings.Index(host, "/"); i > 0 {
 		host = host[:i]
 	}
-	var ips []string
+	var v4, v6 []string
 	if addrs, err := net.LookupHost(host); err == nil {
 		for _, a := range addrs {
-			if net.ParseIP(a) != nil {
-				ips = append(ips, a)
+			ip := net.ParseIP(a)
+			if ip == nil {
+				continue
+			}
+			if ip.To4() != nil {
+				v4 = append(v4, a)
+			} else {
+				v6 = append(v6, a)
 			}
 		}
 	}
 	for _, b := range []string{"162.159.36.5", "162.159.36.20"} {
 		found := false
-		for _, a := range ips {
+		for _, a := range v4 {
 			if a == b {
 				found = true
 				break
 			}
 		}
 		if !found {
-			ips = append(ips, b)
+			v4 = append(v4, b)
 		}
 	}
-	return ips
+	return append(v4, v6...)
 }
 
 func defaultXHosts() []string {
