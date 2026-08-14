@@ -50,8 +50,10 @@ android {
 }
 
 dependencies {
-    // GeckoView（Firefox 内核）—— 最新版
-    implementation("org.mozilla.geckoview:geckoview:153.0.20260810162159")
+    // GeckoView（Firefox 内核）—— 03132010 版已实测能启动
+    // ⚠️ 20260810 最新版在真机启动即 native crash（Application 后 Activity 前），
+    //    回退到实测可用的版本
+    implementation("org.mozilla.geckoview:geckoview:153.0.20260803132010")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
 
