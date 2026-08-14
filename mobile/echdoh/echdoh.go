@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/miekg/dns"
 )
 
@@ -184,6 +185,12 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	if q.Qtype == dns.TypeHTTPS {
 		injectECH(resp, q.Name)
 	}
+	// A 记录改写：若目标原 A 是 CF 托管（AS13335）但 IP 大陆被墙（如
+	// x.com 172.66.0.227），替换为 DoH 端点 IP（162.159.36.x 实测可达）。
+	// AO3 这类原 IP 就是可达 CF 边缘的站点不受影响（IP 相同无变化）。
+	if q.Qtype == dns.TypeA {
+		rewriteAIfCF(resp, q.Name)
+	}
 
 	log.Printf("[doh] %s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
 		len(resp.Answer), summarizeECH(resp))
@@ -317,6 +324,61 @@ func injectECH(resp *dns.Msg, name string) {
 	resp.Answer = append(resp.Answer, svcb)
 	resp.Authoritative = true
 	log.Printf("[doh] injected ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
+}
+
+// rewriteAIfCF 若目标域名的 A 记录全是 CF 边缘（AS13335），则替换为
+// DoH 端点 IP（162.159.36.x，大陆实测可达）。这样 Firefox 拿到 A 记录
+// 直接连可达 IP，绕过被墙的原始边缘（x.com 172.66.0.227）。
+// 非 CF 站点（baidu 等）原样返回，不受影响。
+func rewriteAIfCF(resp *dns.Msg, name string) {
+	var ips []string
+	for _, rr := range resp.Answer {
+		if a, ok := rr.(*dns.A); ok {
+			ips = append(ips, a.A.String())
+		}
+	}
+	if len(ips) == 0 {
+		return
+	}
+	// 只要不是全 CF 就不动（混合或非 CF）
+	cf := cloudflare.AllAS13335(ips)
+	if !cf {
+		log.Printf("[doh] %s: A=%v not CF, keep original", name, ips)
+		return
+	}
+
+	hintIPs := fetchDohEndpointIPv4s()
+	if len(hintIPs) == 0 {
+		return
+	}
+	// 替换所有 A 记录为 DoH 端点 IP（去重）
+	newAnswers := make([]dns.RR, 0, len(resp.Answer)+len(hintIPs))
+	for _, rr := range resp.Answer {
+		switch rr.(type) {
+		case *dns.A, *dns.CNAME:
+			continue // 丢弃原 A/CNAME，下面替换
+		default:
+			newAnswers = append(newAnswers, rr)
+		}
+	}
+	seen := map[string]bool{}
+	for _, ip := range hintIPs {
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		newAnswers = append(newAnswers, &dns.A{
+			Hdr: dns.RR_Header{
+				Name:   name,
+				Rrtype: dns.TypeA,
+				Class:  dns.ClassINET,
+				Ttl:    300,
+			},
+			A: net.ParseIP(ip),
+		})
+	}
+	resp.Answer = newAnswers
+	log.Printf("[doh] %s: CF-hosted A=%v -> rewritten to %v", name, ips, hintIPs)
 }
 
 // fetchDohEndpointIPv4s 解析 DoH 端点域名（如 pieqllv9i7.cloudflare-gateway.com）
