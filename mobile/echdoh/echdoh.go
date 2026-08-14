@@ -185,11 +185,15 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	if q.Qtype == dns.TypeHTTPS {
 		injectECH(resp, q.Name)
 	}
-	// A 记录改写：若目标原 A 是 CF 托管（AS13335）但 IP 大陆被墙（如
-	// x.com 172.66.0.227），替换为 DoH 端点 IP（162.159.36.x 实测可达）。
-	// AO3 这类原 IP 就是可达 CF 边缘的站点不受影响（IP 相同无变化）。
+	// A 记录改写：若目标（跟随 CNAME）是 CF 托管但 IP 大陆被墙，
+	// 替换为 DoH 端点 IP（162.159.36.x 实测可达）。
 	if q.Qtype == dns.TypeA {
 		rewriteAIfCF(resp, q.Name)
+	}
+	// AAAA 清空：CF 托管站点强制 IPv4（DoH 端点 IP），避免 Firefox
+	// 优先 IPv6 超时。非 CF 站点原样保留。
+	if q.Qtype == dns.TypeAAAA {
+		rewriteAAAAEmpty(resp, q.Name)
 	}
 
 	log.Printf("[doh] %s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
@@ -326,24 +330,50 @@ func injectECH(resp *dns.Msg, name string) {
 	log.Printf("[doh] injected ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
 }
 
-// rewriteAIfCF 若目标域名的 A 记录全是 CF 边缘（AS13335），则替换为
-// DoH 端点 IP（162.159.36.x，大陆实测可达）。这样 Firefox 拿到 A 记录
-// 直接连可达 IP，绕过被墙的原始边缘（x.com 172.66.0.227）。
-// 非 CF 站点（baidu 等）原样返回，不受影响。
+// rewriteAIfCF 若目标域名（跟随 CNAME 链）最终解析到 CF 边缘（AS13335），
+// 则把 A 记录改写为 DoH 端点 IP（162.159.36.x，大陆实测可达）。
+//
+// 覆盖 x.com 全家桶：api.x.com / video.twimg.com(.cdn.cloudflare.net) 等
+// 响应只有 CNAME 的域名也跟随判断，避免漏改导致 Firefox 直连被墙边缘。
 func rewriteAIfCF(resp *dns.Msg, name string) {
 	var ips []string
+	var cname string
 	for _, rr := range resp.Answer {
-		if a, ok := rr.(*dns.A); ok {
-			ips = append(ips, a.A.String())
+		switch r := rr.(type) {
+		case *dns.A:
+			ips = append(ips, r.A.String())
+		case *dns.CNAME:
+			cname = r.Target
 		}
 	}
+
+	// 无 A 但有 CNAME：跟随 CNAME 再查（最多 5 跳）
+	hops := 0
+	cur := cname
+	for len(ips) == 0 && cur != "" && hops < 5 {
+		q := new(dns.Msg)
+		q.SetQuestion(dns.Fqdn(cur), dns.TypeA)
+		r2, err := queryUpstream(q)
+		if err != nil {
+			break
+		}
+		cur = ""
+		for _, rr := range r2.Answer {
+			switch r := rr.(type) {
+			case *dns.A:
+				ips = append(ips, r.A.String())
+			case *dns.CNAME:
+				cur = r.Target
+			}
+		}
+		hops++
+	}
 	if len(ips) == 0 {
+		log.Printf("[doh] %s: no A records (cname=%s), keep as-is", name, cname)
 		return
 	}
-	// 只要不是全 CF 就不动（混合或非 CF）
-	cf := cloudflare.AllAS13335(ips)
-	if !cf {
-		log.Printf("[doh] %s: A=%v not CF, keep original", name, ips)
+	if !cloudflare.AllAS13335(ips) {
+		log.Printf("[doh] %s: A=%v not CF (cname=%s), keep original", name, ips, cname)
 		return
 	}
 
@@ -351,12 +381,11 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 	if len(hintIPs) == 0 {
 		return
 	}
-	// 替换所有 A 记录为 DoH 端点 IP（去重）
 	newAnswers := make([]dns.RR, 0, len(resp.Answer)+len(hintIPs))
 	for _, rr := range resp.Answer {
 		switch rr.(type) {
 		case *dns.A, *dns.CNAME:
-			continue // 丢弃原 A/CNAME，下面替换
+			continue // 丢弃原 A/CNAME
 		default:
 			newAnswers = append(newAnswers, rr)
 		}
@@ -378,7 +407,17 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 		})
 	}
 	resp.Answer = newAnswers
-	log.Printf("[doh] %s: CF-hosted A=%v -> rewritten to %v", name, ips, hintIPs)
+	log.Printf("[doh] %s: CF-hosted (cname=%s) A=%v -> rewritten to %v", name, cname, ips, hintIPs)
+}
+
+// rewriteAAAAEmpty 对 CF 托管域名返回空 AAAA（NODATA），强制 Firefox 走
+// IPv4（改写的 DoH 端点 IP），避免等待 IPv6 超时。
+func rewriteAAAAEmpty(resp *dns.Msg, name string) {
+	if len(resp.Answer) == 0 {
+		return
+	}
+	log.Printf("[doh] %s: AAAA cleared (force IPv4)", name)
+	resp.Answer = nil
 }
 
 // fetchDohEndpointIPv4s 解析 DoH 端点域名（如 pieqllv9i7.cloudflare-gateway.com）
