@@ -210,6 +210,23 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Id = req.Id
 
+	// 强制改写名单：x.com 全家桶（已实测 CF 上有完整内容，DNS 轮询
+	// 在 CF/Fastly 间切换，必须无条件强注强改，否则拿到 Fastly IP 时
+	// 误判"非CF"放行 → 明文直连被墙）。
+	if isForceCF(q.Name) {
+		switch q.Qtype {
+		case dns.TypeA:
+			forceRewriteA(resp, q.Name)
+		case dns.TypeAAAA:
+			rewriteAAAAEmpty(resp, q.Name)
+		case dns.TypeHTTPS:
+			injectECHForced(resp, q.Name)
+		}
+		slog("%s %s -> %d answers (forced-CF)", q.Name, dns.TypeToString[q.Qtype],
+			len(resp.Answer))
+		return
+	}
+
 	if q.Qtype == dns.TypeHTTPS {
 		injectECH(resp, q.Name)
 	}
@@ -366,6 +383,92 @@ func injectECH(resp *dns.Msg, name string) {
 	resp.Answer = append(resp.Answer, svcb)
 	resp.Authoritative = true
 	slog("injected ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
+}
+
+// isForceCF 判断域名是否属于"强制 CF"名单（x.com 全家桶）。
+// 2026-08-14 实测：abs/pbs/video.twimg.com 的内容在 CF 上存在（真实
+// 路径 200），但 DNS 在 CF/Fastly 间轮询——拿到 Fastly IP 时必须
+// 无条件改写，否则直连 Fastly 明文被墙。名单随 x.com 迁移扩展。
+func isForceCF(name string) bool {
+	n := strings.ToLower(dns.Fqdn(name))
+	n = strings.TrimSuffix(n, ".")
+	if n == "x.com" || n == "twitter.com" {
+		return true
+	}
+	if strings.HasSuffix(n, ".x.com") || strings.HasSuffix(n, ".twitter.com") ||
+		strings.HasSuffix(n, ".twimg.com") {
+		return true
+	}
+	return false
+}
+
+// forceRewriteA 无条件把 A 记录改写为 DoH 端点 IP（不判断 CF）。
+func forceRewriteA(resp *dns.Msg, name string) {
+	hintIPs := fetchDohEndpointIPv4s()
+	if len(hintIPs) == 0 {
+		return
+	}
+	newAnswers := make([]dns.RR, 0, len(hintIPs))
+	for _, rr := range resp.Answer {
+		switch rr.(type) {
+		case *dns.A, *dns.CNAME:
+			continue
+		default:
+			newAnswers = append(newAnswers, rr)
+		}
+	}
+	seen := map[string]bool{}
+	for _, ip := range hintIPs {
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		newAnswers = append(newAnswers, &dns.A{
+			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.ParseIP(ip),
+		})
+	}
+	resp.Answer = newAnswers
+	slog("%s: FORCED A -> %v", name, hintIPs)
+}
+
+// injectECHForced 无条件注入 CF 公共 ECH 公钥（不判断是否 CF 托管）。
+func injectECHForced(resp *dns.Msg, name string) {
+	for _, rr := range resp.Answer {
+		for _, kv := range svcbValues(rr) {
+			if _, isECH := kv.(*dns.SVCBECHConfig); isECH {
+				return // 已有 ech= 不动
+			}
+		}
+	}
+	echConfig := fetchCFPublicECH()
+	if len(echConfig) == 0 {
+		slog("%s: no CF public ECH key available, skip forced inject", name)
+		return
+	}
+	hintIPs := fetchDohEndpointIPv4s()
+	svcb := &dns.SVCB{
+		Hdr:      dns.RR_Header{Name: name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 300},
+		Priority: 1,
+		Target:   ".",
+		Value: []dns.SVCBKeyValue{
+			&dns.SVCBECHConfig{ECH: echConfig},
+			&dns.SVCBAlpn{Alpn: []string{"http/1.1"}},
+		},
+	}
+	if len(hintIPs) > 0 {
+		hints := make([]net.IP, 0, len(hintIPs))
+		for _, h := range hintIPs {
+			if ip := net.ParseIP(h); ip != nil {
+				hints = append(hints, ip)
+			}
+		}
+		if len(hints) > 0 {
+			svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: hints})
+		}
+	}
+	resp.Answer = []dns.RR{svcb}
+	slog("FORCED ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
 }
 
 // isCloudflareHosted 跟随 CNAME 链（≤5 跳）查询目标 A 记录，判断是否
