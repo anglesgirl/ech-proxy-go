@@ -51,7 +51,7 @@ android {
 
 dependencies {
     // GeckoView（Firefox 内核）—— 最新版
-    implementation("org.mozilla.geckoview:geckoview:153.0.20260803132010")
+    implementation("org.mozilla.geckoview:geckoview:153.0.20260810162159")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
 

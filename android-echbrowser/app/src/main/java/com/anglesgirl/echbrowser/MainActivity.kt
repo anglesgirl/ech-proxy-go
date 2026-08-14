@@ -6,7 +6,10 @@ import android.content.ClipData
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
@@ -20,6 +23,7 @@ import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
+import java.io.File
 
 /**
  * ECH 浏览器 Demo —— GeckoView（Firefox 内核）+ 本地 DoH 注入 ECH。
@@ -205,7 +209,32 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showLogs() {
-        val text = if (EchApp.logFile.exists()) EchApp.logFile.readText() else "暂无日志"
+        // 从公共 Download 目录读日志
+        var text = "暂无日志"
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val resolver = contentResolver
+                resolver.query(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    arrayOf(MediaStore.Downloads.DISPLAY_NAME, MediaStore.Downloads.DATA),
+                    "${MediaStore.Downloads.DISPLAY_NAME} = ?",
+                    arrayOf("echbrowser.log"), null
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val data = c.getString(c.getColumnIndexOrThrow(MediaStore.Downloads.DATA))
+                        text = File(data).readText()
+                    }
+                }
+            } else {
+                val f = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "echbrowser.log"
+                )
+                if (f.exists()) text = f.readText()
+            }
+        } catch (e: Throwable) {
+            text = "读取日志失败: $e\n\n${EchApp.logcatFallback()}"
+        }
         val view = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 11f
@@ -222,12 +251,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun exportLogs() {
-        if (!EchApp.logFile.exists()) {
+        // 从公共 Download 目录取日志文件
+        val logFile = try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val resolver = contentResolver
+                var found: File? = null
+                resolver.query(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    arrayOf(MediaStore.Downloads.DISPLAY_NAME, MediaStore.Downloads.DATA),
+                    "${MediaStore.Downloads.DISPLAY_NAME} = ?",
+                    arrayOf("echbrowser.log"), null
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val data = c.getString(c.getColumnIndexOrThrow(MediaStore.Downloads.DATA))
+                        found = File(data)
+                    }
+                }
+                found
+            } else {
+                val f = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "echbrowser.log"
+                )
+                if (f.exists()) f else null
+            }
+        } catch (_: Throwable) { null }
+
+        val logFile2 = logFile
+        if (logFile2 == null || !logFile2.exists()) {
             Toast.makeText(this, "暂无日志", Toast.LENGTH_SHORT).show()
             return
         }
         try {
-            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", EchApp.logFile)
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", logFile2)
             val i = Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
                 putExtra(Intent.EXTRA_STREAM, uri)
