@@ -1,18 +1,19 @@
 // XProbe — x.com 专用强制 ECH 连通性测试（gomobile 导出）
 //
 // 测试思路（用户拍板：直接强制）：
-//   1. 所有 host 一律用 DoH 解析，无视系统 DNS（防污染指向）
-//   2. 不管目标是否发布自己的 ech= 记录，一律强制灌入 Cloudflare 公共
-//      ECH 公钥（cloudflare-ech.com / 内置快照），fallbackPlain=false
-//      —— ECH 失败绝不降级明文（SNI 泄漏）
-//   3. 连接候选 = DoH 解析 IP + 自动并入的 DoH 端点 IP（CF 边缘，可达）
-//   4. 每个 host 报告：解析 IP / ECH accepted / HTTP 状态 / 耗时
+//  1. 所有 host 一律用 DoH 解析，无视系统 DNS（防污染指向）
+//  2. 不管目标是否发布自己的 ech= 记录，一律强制灌入 Cloudflare 公共
+//     ECH 公钥（cloudflare-ech.com / 内置快照），fallbackPlain=false
+//     —— ECH 失败绝不降级明文（SNI 泄漏）
+//  3. 连接候选 = DoH 解析 IP + 自动并入的 DoH 端点 IP（CF 边缘，可达）
+//  4. 每个 host 报告：解析 IP / ECH accepted / HTTP 状态 / 耗时
 package echproxy
 
 import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -50,6 +51,7 @@ func xprobeRun(doh, hosts string) string {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "DoH: %s\n时间: %s\n\n", doh, time.Now().Format("15:04:05"))
+	log.Printf("[xprobe] DoH: %s 时间: %s", doh, time.Now().Format("15:04:05"))
 
 	resolver := dns.New(doh, 10*time.Second, 300*time.Second)
 	dialer := tlsconn.New(20*time.Second, false, false) // fallbackPlain=false → 强制 ECH
@@ -57,9 +59,12 @@ func xprobeRun(doh, hosts string) string {
 	if ips := xResolveDoHHostIPs(doh); len(ips) > 0 {
 		dialer.AppendCustomIPs(ips)
 		fmt.Fprintf(&b, "DoH端点IP兜底: %s\n", strings.Join(ips, ","))
+		log.Printf("[xprobe] DoH端点IP兜底: %s", strings.Join(ips, ","))
 	}
 
 	fmt.Fprintf(&b, "%-20s %-20s %-11s %-6s %-8s %s\n",
+		"HOST", "IP(DoH)", "ECH", "HTTP", "耗时", "结果")
+	log.Printf("[xprobe] %-20s %-20s %-11s %-6s %-8s %s",
 		"HOST", "IP(DoH)", "ECH", "HTTP", "耗时", "结果")
 
 	anyOK := false
@@ -69,15 +74,26 @@ func xprobeRun(doh, hosts string) string {
 			anyOK = true
 		}
 		b.WriteString(line)
+		// 每测完一个 host 立即写入日志，Android 轮询实时可见
+		log.Printf("[xprobe] %s", strings.TrimSuffix(line, "\n"))
 	}
 
 	b.WriteString("\n=== 汇总 ===\n")
+	log.Printf("[xprobe] === 汇总 ===")
 	if anyOK {
 		b.WriteString("✅ 强制灌入 CF 公共 ECH 公钥 + DoH IP 直连 → 可访问\n")
+		log.Printf("[xprobe] ✅ 强制灌入 CF 公共 ECH 公钥 + DoH IP 直连 → 可访问")
 	} else {
 		b.WriteString("❌ 全部失败（见上）\n")
+		log.Printf("[xprobe] ❌ 全部失败（见上）")
 	}
 	return b.String()
+}
+
+// xprobeRunStreaming 与 xprobeRun 相同，但每步结果通过 log 实时输出
+// （StartProbe 后台模式用，PollLogs 增量拉取）。
+func xprobeRunStreaming(doh, hosts string) string {
+	return xprobeRun(doh, hosts)
 }
 
 func xTestHost(resolver *dns.Resolver, dialer *tlsconn.Dialer, host string) (string, bool) {

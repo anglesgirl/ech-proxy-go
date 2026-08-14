@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -23,6 +24,7 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main)
+    private var probing = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,7 +63,7 @@ class MainActivity : ComponentActivity() {
         content.addView(runBtn)
 
         val result = TextView(this).apply {
-            text = "点按钮开始。\n\n说明：\n- 全部域名强制 DoH 解析（无视系统 DNS）\n- 强制灌入 CF 公共 ECH 公钥，ECH 失败不降级明文\n- 自动并入 DoH 端点 IP 兜底（目标边缘 IP 被封时）\n\nECH 列显示 ✅accepted = ECH 握手成功\nHTTP 200 = x.com 真实可访问"
+            text = "点按钮开始。\n\n说明：\n- 全部域名强制 DoH 解析（无视系统 DNS）\n- 强制灌入 CF 公共 ECH 公钥，ECH 失败不降级明文\n- 自动并入 DoH 端点 IP 兜底（目标边缘 IP 被封时）\n\n日志会实时滚动显示，每测完一个域名立即出结果。"
             textSize = 14f
             setTextIsSelectable(true)
             typeface = android.graphics.Typeface.MONOSPACE
@@ -74,28 +76,21 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
 
         runBtn.setOnClickListener {
+            if (probing) {
+                Toast.makeText(this, "测试进行中...", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
             val doh = dohInput.text.toString().trim()
             val hosts = hostsInput.text.toString().trim()
             if (hosts.isEmpty()) {
                 Toast.makeText(this, "请输入域名", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            result.text = "测试中...（每域名约 20s 超时，请耐心）"
+            result.text = ""
             runBtn.isEnabled = false
-            scope.launch {
-                val output = withContext(Dispatchers.IO) {
-                    try {
-                        // gomobile: javapkg + Go包名(echproxy) + 类名(Echproxy)
-                        // 方法名 Java 驼峰化：XProbe → xProbe
-                        com.anglesgirl.xprobe.golib.echproxy.Echproxy.xProbe(doh, hosts)
-                    } catch (e: Throwable) {
-                        "调用失败: ${e.message}\n${e.stackTraceToString()}"
-                    }
-                }
-                result.text = output
-                runBtn.isEnabled = true
-                lastResult = output
-            }
+            runBtn.text = "测试中..."
+            probing = true
+            scope.launch { runProbe(doh, hosts, runBtn) }
         }
 
         exportBtn.setOnClickListener {
@@ -113,7 +108,7 @@ class MainActivity : ComponentActivity() {
                 file.writeText(text)
 
                 // 用 FileProvider 分享，用户可直接发给 AI 分析
-                val uri = androidx.core.content.FileProvider.getUriForFile(
+                val uri = FileProvider.getUriForFile(
                     this, "$packageName.fileprovider", file
                 )
                 val share = Intent(Intent.ACTION_SEND).apply {
@@ -128,6 +123,55 @@ class MainActivity : ComponentActivity() {
                 Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
+    }
+
+    private suspend fun runProbe(doh: String, hosts: String, runBtn: Button) {
+        // 1. 后台启动测试（Go 侧 goroutine，立即返回）
+        val startErr = withContext(Dispatchers.IO) {
+            try {
+                com.anglesgirl.xprobe.golib.echproxy.Echproxy.startProbe(doh, hosts)
+                null
+            } catch (e: Throwable) {
+                e
+            }
+        }
+        if (startErr != null) {
+            result.append("启动失败: ${startErr.message}\n")
+            finishProbe(runBtn)
+            return
+        }
+
+        // 2. 轮询增量日志，实时滚动显示
+        val sb = StringBuilder()
+        while (true) {
+            val done = withContext(Dispatchers.IO) {
+                com.anglesgirl.xprobe.golib.echproxy.Echproxy.isProbeDone()
+            }
+            val delta = withContext(Dispatchers.IO) {
+                com.anglesgirl.xprobe.golib.echproxy.Echproxy.pollLogs()
+            }
+            if (delta.isNotEmpty()) {
+                sb.append(delta)
+                result.text = sb.toString()
+                // 自动滚到底部
+                (result.parent as? ScrollView)?.post { it.fullScroll(ScrollView.FOCUS_DOWN) }
+            }
+            if (done) {
+                // 取最终完整报告供导出
+                lastResult = withContext(Dispatchers.IO) {
+                    com.anglesgirl.xprobe.golib.echproxy.Echproxy.lastProbeResult()
+                }
+                break
+            }
+            delay(300)
+        }
+        finishProbe(runBtn)
+    }
+
+    private fun finishProbe(runBtn: Button) {
+        probing = false
+        runBtn.isEnabled = true
+        runBtn.text = "开始测试（强制 ECH，无降级）"
     }
 
     private var lastResult: String? = null
