@@ -139,16 +139,21 @@ func xTestHost(resolver *dns.Resolver, dialer *tlsconn.Dialer, host string) (str
 	}
 
 	// 4. 复用 TLS 连接发 HTTPS 请求
-	statusCode, respLen, err := xRequest(conn, host, "/", 20*time.Second)
+	statusCode, respLen, bodyPreview, err := xRequest(conn, host, "/", 20*time.Second)
 	if err != nil {
 		return fmt.Sprintf("%s %s %s %-6s %-8s %s\n",
 			pad(host), pad(ipStr), pad(echAccepted), "-", time.Since(start).Round(time.Millisecond),
 			"HTTP: "+err.Error()), false
 	}
 	ok := statusCode >= 200 && statusCode < 400
-	return fmt.Sprintf("%s %s %s %-6d %-8s HTTP %d, body %d bytes\n",
+	line := fmt.Sprintf("%s %s %s %-6d %-8s HTTP %d, body %d bytes\n",
 		pad(host), pad(ipStr), pad(echAccepted), statusCode,
-		time.Since(start).Round(time.Millisecond), statusCode, respLen), ok
+		time.Since(start).Round(time.Millisecond), statusCode, respLen)
+	// 非 2xx/3xx 时附响应 body 预览（判断 403 是 geo block 还是 bot 检测）
+	if !ok && bodyPreview != "" {
+		line += fmt.Sprintf("%s     └─ body: %s\n", pad(""), truncStr(bodyPreview, 300))
+	}
+	return line, ok
 }
 
 // xECHState 读取连接 ECH accepted 状态（utls.UConn 或 crypto/tls）。
@@ -163,15 +168,16 @@ func xECHState(conn net.Conn) (bool, bool) {
 }
 
 // xRequest 在已握手 TLS 连接上发 HTTP/1.1 GET。
-func xRequest(conn net.Conn, host, path string, timeout time.Duration) (int, int, error) {
+// 返回：状态码, body 字节数, 响应头+body 前 800 字节预览（诊断 403 用）。
+func xRequest(conn net.Conn, host, path string, timeout time.Duration) (int, int, string, error) {
 	conn.SetDeadline(time.Now().Add(timeout))
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n\r\n", path, host)
 	if _, err := conn.Write([]byte(req)); err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	body, err := io.ReadAll(io.LimitReader(conn, 256*1024))
 	if err != nil && len(body) == 0 {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	head := string(body)
 	if len(head) > 4096 {
@@ -182,7 +188,30 @@ func xRequest(conn net.Conn, host, path string, timeout time.Duration) (int, int
 	if len(lines) > 0 && strings.HasPrefix(lines[0], "HTTP/") {
 		fmt.Sscanf(lines[0], "HTTP/%d.%d %d", new(int), new(int), &statusCode)
 	}
-	return statusCode, len(body), nil
+	// 预览 = 响应头（前几行）+ body 开头，便于判断 CF 拦截类型
+	preview := ""
+	if len(lines) >= 3 {
+		headers := lines[1]
+		bodyStart := lines[2]
+		// 提取关键 CF 头
+		var cfHits []string
+		for _, h := range strings.Split(headers, "\r\n") {
+			l := strings.ToLower(h)
+			if strings.Contains(l, "cf-ray") || strings.Contains(l, "cf-mitigated") ||
+				strings.Contains(l, "server") || strings.Contains(l, "cf-chl") ||
+				strings.Contains(l, "set-cookie") && strings.Contains(l, "cf_clearance") {
+				cfHits = append(cfHits, h)
+			}
+		}
+		if len(cfHits) > 0 {
+			preview = strings.Join(cfHits, " | ") + " || "
+		}
+		preview += strings.TrimSpace(bodyStart)
+	}
+	if len(preview) > 800 {
+		preview = preview[:800]
+	}
+	return statusCode, len(body), preview, nil
 }
 
 // xResolveDoHHostIPs 解析 DoH 端点域名 IP（系统 DNS 可用时用，失败用内置快照）。
@@ -223,4 +252,11 @@ func defaultXHosts() []string {
 		"abs.twimg.com",
 		"pbs.twimg.com",
 	}
+}
+
+func truncStr(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
