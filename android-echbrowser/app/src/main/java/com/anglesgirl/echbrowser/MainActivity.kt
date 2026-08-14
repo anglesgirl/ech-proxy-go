@@ -129,6 +129,12 @@ class MainActivity : AppCompatActivity() {
         Thread {
             try {
                 log("DOH", "reading certs...")
+                // 加载域名探测缓存（可强改名单自动学习）
+                try {
+                    com.anglesgirl.echbrowser.echdoh.Echdoh.loadProbeCache(
+                        File(filesDir, "probe-cache.json").absolutePath
+                    )
+                } catch (_: Throwable) {}
                 val cert = assets.open("doh-fullchain.pem").bufferedReader().readText()
                 val key = assets.open("doh-key.pem").bufferedReader().readText()
                 log("DOH", "cert ${cert.length}B key ${key.length}B")

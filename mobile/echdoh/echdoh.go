@@ -213,7 +213,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	// 强制改写名单：x.com 全家桶（已实测 CF 上有完整内容，DNS 轮询
 	// 在 CF/Fastly 间切换，必须无条件强注强改，否则拿到 Fastly IP 时
 	// 误判"非CF"放行 → 明文直连被墙）。
-	if isForceCF(q.Name) {
+	if shouldForceCF(q.Name) {
 		switch q.Qtype {
 		case dns.TypeA:
 			forceRewriteA(resp, q.Name)
@@ -629,8 +629,13 @@ func fetchDohEndpointIPv4s() []string {
 		}
 	}
 
-	// 内置快照兜底（pieqllv9i7.cloudflare-gateway.com 已知 IP）
-	for _, ip := range []string{"162.159.36.5", "162.159.36.20"} {
+	// 内置快照兜底：多 IP 候选（大陆可达性不稳定，单一 IP 会全挂）。
+	// 162.159.36.x = DoH 网关；162.159.140.229 = x.com 原边缘(曾实测200)；
+	// 104.18.x/172.64.x = pbs/iwara 等实测可达的 CF 边缘。
+	for _, ip := range []string{
+		"162.159.36.5", "162.159.36.20", "162.159.140.229",
+		"172.64.150.129", "104.18.37.127", "104.20.28.232",
+	} {
 		add(ip)
 	}
 	return ips
