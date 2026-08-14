@@ -188,6 +188,16 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            override fun onLoadError(
+                s: GeckoSession,
+                uri: String?,
+                error: org.mozilla.geckoview.WebRequestError
+            ): org.mozilla.geckoview.GeckoResult<String>? {
+                // 错误码: ERROR_HOST_LOOKUP, ERROR_SECURITY_SSL, ERROR_TIMEOUT 等
+                EchApp.log("GECKO", "loadError uri=$uri error=${error.code} msg=${error.message}")
+                return null // 不处理,让 GeckoView 显示错误页
+            }
+
             override fun onCanGoBack(s: GeckoSession, canGoBack: Boolean) {}
             override fun onCanGoForward(s: GeckoSession, canGoForward: Boolean) {}
         }
@@ -201,16 +211,6 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStop(s: GeckoSession, success: Boolean) {
                 EchApp.log("PAGE", "stop success=$success")
                 setStatus(if (success) "✅ 加载完成" else "❌ 加载失败")
-            }
-
-            override fun onLoadError(
-                s: GeckoSession,
-                uri: String?,
-                error: org.mozilla.geckoview.WebRequestError
-            ): org.mozilla.geckoview.GeckoResult<String>? {
-                // 错误码: ERROR_HOST_LOOKUP, ERROR_SECURITY_SSL, ERROR_TIMEOUT 等
-                EchApp.log("GECKO", "loadError uri=$uri error=${error.code} msg=${error.message}")
-                return null // 不处理,让 GeckoView 显示错误页
             }
 
             override fun onSecurityChange(
