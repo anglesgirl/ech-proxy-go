@@ -29,12 +29,33 @@ import (
 )
 
 var (
-	mu       sync.Mutex
-	srv      *http.Server
-	running  bool
-	upstream []string
-	lastErr  string
+	mu        sync.Mutex
+	srv       *http.Server
+	running   bool
+	upstream  []string
+	lastErr   string
+	logSink   func(string)
+	logSinkMu sync.Mutex
 )
+
+// SetLogSink 注册日志回调。Go 侧所有 [doh] 日志会同时推给 sink
+// （Android 端写入 echbrowser.log），便于诊断。传 nil 取消。
+func SetLogSink(fn func(string)) {
+	logSinkMu.Lock()
+	logSink = fn
+	logSinkMu.Unlock()
+}
+
+// slog 带 sink 的日志：既写 stderr（logcat），也推给 Android 日志文件。
+func slog(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("[doh] %s", msg)
+	logSinkMu.Lock()
+	if logSink != nil {
+		logSink(msg)
+	}
+	logSinkMu.Unlock()
+}
 
 // Start 启动本地 DoH 注入服务器（127.0.0.1:listen）。
 // certPEM/keyPEM 为合法域名证书（PEM 文本），upstreams 为逗号分隔的上游 DoH。
@@ -176,7 +197,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := queryUpstream(req)
 	if err != nil {
-		log.Printf("[doh] upstream error for %s %s: %v", q.Name, dns.TypeToString[q.Qtype], err)
+		slog("upstream error for %s %s: %v", q.Name, dns.TypeToString[q.Qtype], err)
 		writeError(w, req, dns.RcodeServerFailure)
 		return
 	}
@@ -196,7 +217,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		rewriteAAAAEmpty(resp, q.Name)
 	}
 
-	log.Printf("[doh] %s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
+	slog("%s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
 		len(resp.Answer), summarizeECH(resp))
 
 	out, err := resp.Pack()
@@ -291,7 +312,7 @@ func injectECH(resp *dns.Msg, name string) {
 	// 获取 CF 公共 ECH 公钥
 	echConfig := fetchCFPublicECH()
 	if len(echConfig) == 0 {
-		log.Printf("[doh] %s: no CF public ECH key available, skip inject", name)
+		slog("%s: no CF public ECH key available, skip inject", name)
 		return
 	}
 
@@ -329,7 +350,7 @@ func injectECH(resp *dns.Msg, name string) {
 	}
 	resp.Answer = append(resp.Answer, svcb)
 	resp.Authoritative = true
-	log.Printf("[doh] injected ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
+	slog("injected ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs)
 }
 
 // rewriteAIfCF 若目标域名（跟随 CNAME 链）最终解析到 CF 边缘（AS13335），
@@ -371,11 +392,11 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 		hops++
 	}
 	if len(ips) == 0 {
-		log.Printf("[doh] %s: no A records (cname=%s), keep as-is", name, cname)
+		slog("%s: no A records (cname=%s), keep as-is", name, cname)
 		return
 	}
 	if !cloudflare.AllAS13335(ips) {
-		log.Printf("[doh] %s: A=%v not CF (cname=%s), keep original", name, ips, cname)
+		slog("%s: A=%v not CF (cname=%s), keep original", name, ips, cname)
 		return
 	}
 
@@ -409,7 +430,7 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 		})
 	}
 	resp.Answer = newAnswers
-	log.Printf("[doh] %s: CF-hosted (cname=%s) A=%v -> rewritten to %v", name, cname, ips, hintIPs)
+	slog("%s: CF-hosted (cname=%s) A=%v -> rewritten to %v", name, cname, ips, hintIPs)
 }
 
 // rewriteAAAAEmpty 对 CF 托管域名返回空 AAAA（NODATA），强制 Firefox 走
@@ -418,7 +439,7 @@ func rewriteAAAAEmpty(resp *dns.Msg, name string) {
 	if len(resp.Answer) == 0 {
 		return
 	}
-	log.Printf("[doh] %s: AAAA cleared (force IPv4)", name)
+	slog("%s: AAAA cleared (force IPv4)", name)
 	resp.Answer = nil
 }
 
@@ -471,7 +492,7 @@ func fetchCFPublicECH() []byte {
 	q.SetQuestion("cloudflare-ech.com.", dns.TypeHTTPS)
 	resp, err := queryUpstream(q)
 	if err != nil {
-		log.Printf("[doh] fetchCFPublicECH upstream error: %v", err)
+		slog("fetchCFPublicECH upstream error: %v", err)
 		return nil
 	}
 	for _, rr := range resp.Answer {

@@ -109,6 +109,10 @@ class MainActivity : AppCompatActivity() {
     private fun startEchDoh() {
         Thread {
             try {
+                // Go 侧日志回调 → 写入 echbrowser.log（诊断关键）
+                com.anglesgirl.echbrowser.echdoh.Echdoh.setLogSink { msg ->
+                    log("DOH", msg)
+                }
                 log("DOH", "reading certs...")
                 val cert = assets.open("doh-fullchain.pem").bufferedReader().readText()
                 val key = assets.open("doh-key.pem").bufferedReader().readText()
