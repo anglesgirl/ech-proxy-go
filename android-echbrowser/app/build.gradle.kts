@@ -28,8 +28,24 @@ android {
         }
     }
 
-    buildFeatures {
-        viewBinding = true
+    buildTypes {
+        debug {
+            // GeckoView 必需：libxul.so (152MB) 必须解压加载，不能从压缩 APK mmap
+            // 否则启动即 native crash（无 Java 堆栈的闪退）
+            packaging {
+                jniLibs {
+                    useLegacyPackaging = true
+                }
+            }
+        }
+        release {
+            isMinifyEnabled = false
+            packaging {
+                jniLibs {
+                    useLegacyPackaging = true
+                }
+            }
+        }
     }
 }
 

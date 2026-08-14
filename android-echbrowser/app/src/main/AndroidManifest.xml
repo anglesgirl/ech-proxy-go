@@ -7,6 +7,7 @@
         android:allowBackup="true"
         android:label="ECH 浏览器"
         android:supportsRtl="true"
+        android:extractNativeLibs="true"
         android:theme="@style/Theme.EchBrowser">
 
         <activity
@@ -20,9 +21,7 @@
             </intent-filter>
         </activity>
 
-        <!-- GeckoView 需要：支持 cleartext 用于本地 DoH（127.0.0.1 走 HTTPS，但保留配置） -->
-        <uses-library android:name="org.mozilla.geckoview" android:required="false" />
-
+        <!-- GeckoView 是 Gradle 依赖库，不是系统库 -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

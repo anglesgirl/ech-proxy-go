@@ -63,11 +63,22 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", handleDoH)
 
+	// 用 PEM 内容直接构造 TLS 证书（ListenAndServeTLS 只接受文件路径，
+	// gomobile 场景拿不到文件系统路径，必须 X509KeyPair 加载内容）。
+	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
+	if err != nil {
+		mu.Lock()
+		lastErr = "load cert: " + err.Error()
+		mu.Unlock()
+		return fmt.Errorf("load cert: %w", err)
+	}
+
 	s := &http.Server{
 		Addr:    listen,
 		Handler: mux,
 		TLSConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
 		},
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -85,7 +96,8 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 				mu.Unlock()
 			}
 		}()
-		if err := s.ListenAndServeTLS(certPEM, keyPEM); err != nil && err != http.ErrServerClosed {
+		// 已用 X509KeyPair 加载证书，Serve 而非 ListenAndServeTLS
+		if err := s.ServeTLS(nil, "", ""); err != nil && err != http.ErrServerClosed {
 			mu.Lock()
 			lastErr = "serve: " + err.Error()
 			running = false
