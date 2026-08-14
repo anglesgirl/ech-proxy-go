@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.EchBrowser" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:statusBarColor">#101428</item>
+        <item name="android:navigationBarColor">#101428</item>
+        <item name="android:windowBackground">#101428</item>
+        <item name="android:colorBackground">#101428</item>
+    </style>
+</resources>

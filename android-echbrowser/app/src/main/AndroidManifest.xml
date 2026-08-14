@@ -2,31 +2,29 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Android 8/9 写公共 Download 目录（10+ 用 MediaStore 无需权限） -->
-    <uses-permission
-        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".EchApp"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:label="ECH 浏览器"
         android:supportsRtl="true"
-        android:extractNativeLibs="true"
-        android:theme="@style/Theme.EchBrowser">
+        android:theme="@style/Theme.EchBrowser"
+        android:usesCleartextTraffic="false"
+        android:hardwareAccelerated="true">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:windowSoftInputMode="adjustResize"
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="stateUnspecified|adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- GeckoView 是 Gradle 依赖库，不是系统库 -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
