@@ -123,6 +123,9 @@ class MainActivity : AppCompatActivity() {
                     log("DOH", "start() threw: ${e.message}")
                 }
                 Thread.sleep(1000)
+                // 打印服务内部错误（ServeTLS 失败等 goroutine 内错误）
+                val lastErr = com.anglesgirl.echbrowser.echdoh.Echdoh.lastError()
+                log("DOH", "LastError: ${if (lastErr.isNullOrEmpty()) "(none)" else lastErr}")
                 try {
                     val s = java.net.Socket("127.0.0.1", DOH_PORT.toInt())
                     s.close()

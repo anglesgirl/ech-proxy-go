@@ -96,8 +96,9 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 				mu.Unlock()
 			}
 		}()
-		// 已用 X509KeyPair 加载证书，Serve 而非 ListenAndServeTLS
-		if err := s.ServeTLS(nil, "", ""); err != nil && err != http.ErrServerClosed {
+		// 已用 X509KeyPair 加载证书。必须用 ListenAndServeTLS（自动创建
+		// listener）；ServeTLS(nil,...) 传 nil listener 会 panic。
+		if err := s.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 			mu.Lock()
 			lastErr = "serve: " + err.Error()
 			running = false
