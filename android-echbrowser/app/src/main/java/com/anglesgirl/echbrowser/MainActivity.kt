@@ -151,6 +151,15 @@ class MainActivity : AppCompatActivity() {
                 // 打印服务内部错误（ServeTLS 失败等 goroutine 内错误）
                 val lastErr = com.anglesgirl.echbrowser.echdoh.Echdoh.lastError()
                 log("DOH", "LastError: ${if (lastErr.isNullOrEmpty()) "(none)" else lastErr}")
+                // 等待 CF IP 扫描完成（最多 15s），打印轮换池
+                for (i in 0..15) {
+                    val pool = com.anglesgirl.echbrowser.echdoh.Echdoh.reachableCFIPsForTest()
+                    if (pool.isNotBlank()) {
+                        log("DOH", "CF IP pool ($DOH_PORT reachable):\n${pool.trim()}")
+                        break
+                    }
+                    Thread.sleep(1000)
+                }
                 try {
                     val s = java.net.Socket("127.0.0.1", DOH_PORT.toInt())
                     s.close()

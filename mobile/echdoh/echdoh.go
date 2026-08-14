@@ -89,6 +89,9 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 		}
 	}
 
+	// 后台扫描 CF IP 段找可达边缘（进轮换池，解决单一 IP 抖动）
+	StartScanCFIPs(64)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", handleDoH)
 
@@ -605,6 +608,11 @@ func fetchDohEndpointIPv4s() []string {
 			seen[ip] = true
 			ips = append(ips, ip)
 		}
+	}
+
+	// 扫描池（启动时随机扫到的可达 CF IP）优先
+	for _, ip := range reachableCFIPs() {
+		add(ip)
 	}
 
 	// 从 upstream DoH 域名解析 A 记录
