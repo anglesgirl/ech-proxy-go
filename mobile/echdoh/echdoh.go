@@ -12,6 +12,7 @@
 package echdoh
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
@@ -418,11 +419,64 @@ func tcpReachable(ip string, timeout time.Duration) bool {
 	return true
 }
 
-// officialSubnetIPs 从官方解析 CF IP 生成候选，全部经过 TCP 443 可达性
-// 过滤：官方 IP 优先（测可达），再从官方 IP 的 /24 段随机采样补足。
-// 官方段整体不可达（如 x.com 172.66.0.x）时返回空 → 调用方回退 DoH
-// 端点/扫描池 IP。
-func officialSubnetIPs(official []string, max int) []string {
+// echHandshakeCache ECH 握手测试结果缓存（域名+IP → 是否 ECH accepted）。
+// 避免每次 A 查询都重复握手（x.com 的 A 查询被 Firefox 反复触发）。
+var (
+	echTestMu    sync.Mutex
+	echTestCache = map[string]bool{}
+)
+
+// echHandshakeOK 对候选 IP 做完整 ECH 握手测试（TCP + ClientHello 带 CF
+// 公共 ECH 公钥），只认 ECHAccepted=true。2026-08-15 用户 xprobe 实测
+// 决定性证据：x.com 官方段 162.159.140.x ECH accepted → HTTP 200（1.5s），
+// 而同段 172.66.0.x ECH 握手挂起（echbrowser Firefox code=37 超时）——
+// 官方解析多段中部分段不响应 ECH。必须探测后只改写到 ECH 可用的段。
+func echHandshakeOK(ip, host string, timeout time.Duration) bool {
+	cacheKey := host + "|" + ip
+	echTestMu.Lock()
+	if v, ok := echTestCache[cacheKey]; ok {
+		echTestMu.Unlock()
+		return v
+	}
+	echTestMu.Unlock()
+	ok := func() bool {
+		d := &net.Dialer{Timeout: timeout}
+		conn, err := d.Dial("tcp", net.JoinHostPort(ip, "443"))
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+		ech := fetchCFPublicECH()
+		if len(ech) == 0 {
+			slog("%s: no CF public ECH key, skip ECH probe for %s", host, ip)
+			return false
+		}
+		cfg := &tls.Config{
+			ServerName:                     host,
+			MinVersion:                     tls.VersionTLS13,
+			NextProtos:                     []string{"http/1.1"},
+			EncryptedClientHelloConfigList: ech,
+		}
+		tc := tls.Client(conn, cfg)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := tc.HandshakeContext(ctx); err != nil {
+			return false
+		}
+		return tc.ConnectionState().ECHAccepted
+	}()
+	echTestMu.Lock()
+	echTestCache[cacheKey] = ok
+	echTestMu.Unlock()
+	slog("%s %s: ECH probe -> %v", host, ip, ok)
+	return ok
+}
+
+// officialSubnetIPs 从官方解析 CF IP 生成候选，全部经过 ECH 握手探测：
+// 官方 IP 优先（ECH accepted 才用），再从官方 IP 的 /24 段随机采样补足。
+// 官方段整体 ECH 不可用（如 x.com 172.66.0.x 挂起）时返回空 → 调用方
+// 回退 DoH 端点/扫描池 IP。
+func officialSubnetIPs(official []string, name string, max int) []string {
 	var out []string
 	seen := map[string]bool{}
 	add := func(ip string) bool {
@@ -433,10 +487,10 @@ func officialSubnetIPs(official []string, max int) []string {
 		out = append(out, ip)
 		return len(out) >= max
 	}
-	// 1. 官方 IP 本身（测可达才用）；记录第一个可达的用于同段采样
+	// 1. 官方 IP 本身（ECH 握手 accepted 才用）；记录第一个可达的用于同段采样
 	var reachableOfficial string
 	for _, ip := range official {
-		if tcpReachable(ip, 1500*time.Millisecond) {
+		if echHandshakeOK(ip, name, 1500*time.Millisecond) {
 			if reachableOfficial == "" {
 				reachableOfficial = ip
 			}
@@ -445,8 +499,8 @@ func officialSubnetIPs(official []string, max int) []string {
 			}
 		}
 	}
-	// 2. 第一个可达官方 IP 的 /24 段随机采样（同样测可达）；
-	//    官方段整体不可达（x.com 172.66.0.x 移动宽带超时）时返回空。
+	// 2. 第一个 ECH 可用官方 IP 的 /24 段随机采样（同样 ECH 探测）；
+	//    官方段整体 ECH 不可用（x.com 172.66.0.x 挂起）时返回空。
 	if reachableOfficial == "" {
 		return out
 	}
@@ -468,7 +522,7 @@ func officialSubnetIPs(official []string, max int) []string {
 		if seen[ip] {
 			continue
 		}
-		if tcpReachable(ip, 1500*time.Millisecond) {
+		if echHandshakeOK(ip, name, 1500*time.Millisecond) {
 			add(ip)
 		}
 	}
@@ -496,8 +550,8 @@ func officialCFIPv4s(resp *dns.Msg) []string {
 func forceRewriteA(resp *dns.Msg, name string) {
 	var hintIPs []string
 	if official := officialCFIPv4s(resp); len(official) > 0 {
-		hintIPs = officialSubnetIPs(official, 6)
-		slog("%s: FORCED A -> official-subnet %v", name, hintIPs)
+		hintIPs = officialSubnetIPs(official, name, 6)
+		slog("%s: FORCED A -> official-subnet(ECH-probed) %v", name, hintIPs)
 	} else {
 		hintIPs = fetchDohEndpointIPv4s()
 		slog("%s: no official CF A, fallback DoH endpoint %v", name, hintIPs)
@@ -659,7 +713,7 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 
 	// 2026-08-15: 官方 CF IP 同 /24 段优先（信誉与官方同级，规避 403）；
 	// 无官方 IP（理论不发生，前面已验证 AS13335）才回退 DoH 端点 IP。
-	hintIPs := officialSubnetIPs(ips, 6)
+	hintIPs := officialSubnetIPs(ips, name, 6)
 	if len(hintIPs) == 0 {
 		hintIPs = fetchDohEndpointIPv4s()
 	}
