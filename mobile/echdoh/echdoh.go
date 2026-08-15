@@ -579,7 +579,9 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 	ch := make(chan res, len(official))
 	for _, ip := range official {
 		go func(ip string) {
-			ch <- res{ip, echHandshakeOK(ip, name, 1500*time.Millisecond)}
+			// 3s 超时（2026-08-15 修复：xprobe 实测 x.com ECH 握手
+			// 1.519s，原 1.5s 超时卡边，抖动即 false；并发探测总耗时不变）
+			ch <- res{ip, echHandshakeOK(ip, name, 3 * time.Second)}
 		}(ip)
 	}
 	var reachable []string
@@ -620,7 +622,7 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 					continue
 				}
 				go func(ip string) {
-					sch <- sres{ip, echHandshakeOK(ip, name, 1500*time.Millisecond)}
+					sch <- sres{ip, echHandshakeOK(ip, name, 3*time.Second)}
 				}(ip)
 			}
 			for range cand[:limit] {
