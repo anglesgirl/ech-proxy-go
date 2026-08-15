@@ -55,19 +55,35 @@ func resolveDoHHostIPs(dohURL string) []string {
 	host := u.Hostname()
 
 	// 1. 系统 DNS 解析(DoH 端点域名一般未被污染)。
+	// ⚠️ net.LookupHost 无超时：移动宽带被污染的系统 DNS 能卡 30s+
+	// （2026-08-15 CO3 实测：冷启动 Start() 卡 30s）。3s 超时走快照。
 	var v4, v6 []string
-	if addrs, err := net.LookupHost(host); err == nil {
-		for _, a := range addrs {
-			ip := net.ParseIP(a)
-			if ip == nil {
-				continue
-			}
-			if ip.To4() != nil {
-				v4 = append(v4, a)
-			} else {
-				v6 = append(v6, a)
+	type lookupRes struct {
+		addrs []string
+		err   error
+	}
+	lch := make(chan lookupRes, 1)
+	go func() {
+		addrs, err := net.LookupHost(host)
+		lch <- lookupRes{addrs, err}
+	}()
+	select {
+	case r := <-lch:
+		if r.err == nil {
+			for _, a := range r.addrs {
+				ip := net.ParseIP(a)
+				if ip == nil {
+					continue
+				}
+				if ip.To4() != nil {
+					v4 = append(v4, a)
+				} else {
+					v6 = append(v6, a)
+				}
 			}
 		}
+	case <-time.After(3 * time.Second):
+		// 超时：跳过系统 DNS，直接用内置快照
 	}
 	// 2. 内置快照兜底。
 	for _, b := range builtinDoHHostIPs {
