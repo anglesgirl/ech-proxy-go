@@ -99,7 +99,46 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 - 验证：`curl "https://<doh>/dns-query?name=X&type=A" -H "Accept: application/dns-json"` 应 200。
 - 另：种子列表里 alidns（223.5.5.5/223.6.6.6）在国内频繁超时/抖动，疑似 429 相关，**已从种子列表移除**（2026-08-06），保留 360 / DNSPod / 腾讯备用。
 
-### 1.7 崩溃 / 日志
+### 1.8 【致命】DoH handler 每个 return 分支都必须写响应体（2026-08-15 实测）
+
+- 症状：echbrowser 里 x.com 完全打不开，`loadError code=37 error=0x25`。日志显示
+  `x.com A -> 6 answers (forced-CF)`，IP 看着完全正常。
+- 根因：`handleDoH` 的 forced-CF 分支（x.com 全家桶）改写完 IP、注入完 ech= 后
+  **直接 `return`，从未执行 `resp.Pack()` + `w.Write(out)`** —— 写响应的代码在
+  函数更下面，该分支永远走不到。响应体 0 字节。
+  Firefox TRR 解析空响应失败，`trr.mode=3` 无 Do53 回退 → 立即 loadError。
+- **日志会骗人**：`-> N answers` 记的是内存里的 `resp.Answer`，跟有没有发出去
+  毫无关系。排查时不要把它当作「已应答」的证据。
+- 修复：所有出口统一走 `writeResponse(w, resp)`；`mobile/echdoh/handler_test.go`
+  用 `httptest` 断言响应体非空（修复前该测试失败，是有效回归网）。
+- 教训：这个 bug 让我们连续两轮在「选哪些 IP」上做优化（ECH 探测、兜底策略、
+  可达池），全部无效 —— 因为选什么都没发出去。**改 DNS 应答逻辑前，先用
+  `cmd/dohbench` 确认客户端真的收到了字节。**
+
+### 1.9 排查 DoH/浏览器连接问题的正确起点：cmd/dohbench
+
+不要一上来就看浏览器日志或改 IP 策略。`cmd/dohbench` 进程内起真实 echdoh，
+用严格 deadline 的 DoH 客户端打 A/AAAA/HTTPS，报每条查询的**延迟 + 判定 + 实际答案**：
+
+```bash
+go run ./cmd/dohbench                            # 默认 x.com 全家桶，冷/热两轮
+go run ./cmd/dohbench -hosts x.com -v            # 带 echdoh 内部日志
+go run ./cmd/dohbench -budget 3000               # Firefox trr.request-timeout 默认值
+```
+
+它能在任何网络环境下跑（不依赖墙外可达性），因为测的是 handler 逻辑本身：
+空响应体、超预算、A 记录为空这三类致命问题都会直接标红。
+
+判定含义：
+- `ERR unpack: ... overflow unpacking uint16` = **响应体空**（见 1.8）
+- `TIMEOUT` = 超过 Firefox 预算，`trr.mode=3` 无回退 → loadError
+- `EMPTY` = A 记录 0 条，Firefox 立即 loadError
+- `OK` + 答案内容 = 正常，此时问题在 TLS/ECH 连接层，才该去看 xprobe
+
+**坑**：解析 HTTPS 记录时，`Unpack` 后的类型是 `*dns.HTTPS`（内嵌 SVCB），
+不是 `*dns.SVCB`。只判断后者会把所有真实响应漏掉、误报 `(no svcb)`。
+
+### 1.10 崩溃 / 日志
 
 - Android 端 `DiagnosticsLog` 持久化事件日志 + 崩溃自动写 Downloads（`Han1meViewer-crash-*.txt`）。
 - Go 端 `Diagnostics()` 返回生命周期状态 + 有界日志（DNS 源 / ECH accept-reject / 降级 / 路由 / 上游错误）。
@@ -112,6 +151,7 @@ Go 侧 `handleAppLayer` 自己完成 ECH/普通 TLS 连上游，**返回明文 H
 
 | 症状 | 看什么 |
 |---|---|
+| **浏览器 loadError code=37 / 站点完全打不开** | **先跑 `go run ./cmd/dohbench`（见 1.9）。响应体空 = 1.8 的 bug。别先改 IP 策略** |
 | OkHttp 报 `Unable to parse TLS packet header` | 是不是 CONNECT 返回了已握手 TLS（违反 1.1） |
 | 日志 `no ECHConfig for host, plain TLS` 但该 host 其实支持 ECH | 解析被污染（违反 1.3），核对 IP 是否 Facebook 段 |
 | 直连真实 IP 超时 / Connection reset | 请求没走 ECH（拦截器未生效 / select 返回了代理），或该 host 本身不支持 ECH 且被墙 |

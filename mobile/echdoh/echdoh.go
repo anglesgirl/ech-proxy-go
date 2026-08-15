@@ -274,14 +274,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			resp.Answer = nil
 			slog("%s: OVERRIDE AAAA -> empty", q.Name)
 		}
-		out, err := resp.Pack()
-		if err != nil {
-			http.Error(w, "pack failed", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/dns-message")
-		w.Header().Set("Cache-Control", "max-age=60")
-		w.Write(out)
+		writeResponse(w, resp)
 		return
 	}
 
@@ -299,6 +292,12 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		}
 		slog("%s %s -> %d answers (forced-CF)", q.Name, dns.TypeToString[q.Qtype],
 			len(resp.Answer))
+		// ⚠️ 2026-08-15 根因：这里原本直接 return，从未 Pack + Write ——
+		// x.com 全家桶的 DoH 响应体为空（0 字节），Firefox TRR 解析失败，
+		// trr.mode=3 无 Do53 回退 → loadError code=37。日志里
+		// "x.com A -> 6 answers (forced-CF)" 只是内存里的答案，没发出去。
+		// dohbench 实测：客户端收到 "overflow unpacking uint16"（空响应）。
+		writeResponse(w, resp)
 		return
 	}
 
@@ -321,8 +320,15 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	slog("%s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
 		len(resp.Answer), summarizeECH(resp))
 
+	writeResponse(w, resp)
+}
+
+// writeResponse 打包并写出 DNS 响应。所有出口必须走这里 —— 2026-08-15
+// 的 code=37 根因就是 forced-CF 分支绕过了写响应的代码直接 return。
+func writeResponse(w http.ResponseWriter, resp *dns.Msg) {
 	out, err := resp.Pack()
 	if err != nil {
+		slog("pack failed: %v", err)
 		http.Error(w, "pack failed", http.StatusInternalServerError)
 		return
 	}
