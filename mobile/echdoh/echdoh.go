@@ -490,11 +490,17 @@ func tcpReachable(ip string, timeout time.Duration) bool {
 }
 
 // echHandshakeCache ECH 握手测试结果缓存（域名+IP → 是否 ECH accepted）。
-// 避免每次 A 查询都重复握手（x.com 的 A 查询被 Firefox 反复触发）。
+// false 结果只缓存 60s（2026-08-15 实测同一 IP 探测结果不稳定：网络抖动
+// 时一次 false 会害死整段），true 缓存 10min。
 var (
 	echTestMu    sync.Mutex
-	echTestCache = map[string]bool{}
+	echTestCache = map[string]echTestEntry{}
 )
+
+type echTestEntry struct {
+	ok  bool
+	ts  time.Time
+}
 
 // echHandshakeOK 对候选 IP 做完整 ECH 握手测试（TCP + ClientHello 带 CF
 // 公共 ECH 公钥），只认 ECHAccepted=true。2026-08-15 用户 xprobe 实测
@@ -504,9 +510,16 @@ var (
 func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 	cacheKey := host + "|" + ip
 	echTestMu.Lock()
-	if v, ok := echTestCache[cacheKey]; ok {
-		echTestMu.Unlock()
-		return v
+	if e, ok := echTestCache[cacheKey]; ok {
+		// true 缓存 10min；false 只缓存 60s（网络抖动时允许重测）
+		ttl := 10 * time.Minute
+		if !e.ok {
+			ttl = 60 * time.Second
+		}
+		if time.Since(e.ts) < ttl {
+			echTestMu.Unlock()
+			return e.ok
+		}
 	}
 	echTestMu.Unlock()
 	ok := func() bool {
@@ -536,7 +549,7 @@ func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 		return tc.ConnectionState().ECHAccepted
 	}()
 	echTestMu.Lock()
-	echTestCache[cacheKey] = ok
+	echTestCache[cacheKey] = echTestEntry{ok: ok, ts: time.Now()}
 	echTestMu.Unlock()
 	slog("%s %s: ECH probe -> %v", host, ip, ok)
 	return ok
@@ -557,43 +570,65 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 		out = append(out, ip)
 		return len(out) >= max
 	}
-	// 1. 官方 IP 本身（ECH 握手 accepted 才用）；记录第一个可达的用于同段采样
-	var reachableOfficial string
+	// 1. 官方 IP 并发 ECH 探测（~1.5s 并行完成，2026-08-15 修复：串行
+	//    探测 45s 才完成，期间 A 记录为空 → Firefox 立即 loadError）
+	type res struct {
+		ip string
+		ok bool
+	}
+	ch := make(chan res, len(official))
 	for _, ip := range official {
-		if echHandshakeOK(ip, name, 1500*time.Millisecond) {
-			if reachableOfficial == "" {
-				reachableOfficial = ip
-			}
+		go func(ip string) {
+			ch <- res{ip, echHandshakeOK(ip, name, 1500*time.Millisecond)}
+		}(ip)
+	}
+	var reachable []string
+	for range official {
+		r := <-ch
+		if r.ok {
+			reachable = append(reachable, r.ip)
+		}
+	}
+	// 2. 第一个 ECH 可用官方 IP 的 /24 段随机采样（并发探测补足）
+	if len(reachable) > 0 {
+		for _, ip := range reachable {
 			if add(ip) {
 				return out
 			}
 		}
-	}
-	// 2. 第一个 ECH 可用官方 IP 的 /24 段随机采样（同样 ECH 探测）；
-	//    官方段整体 ECH 不可用（x.com 172.66.0.x 挂起）时返回空。
-	if reachableOfficial == "" {
-		return out
-	}
-	v4 := net.ParseIP(reachableOfficial).To4()
-	if v4 == nil {
-		return out
-	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	var cand []int
-	for i := 1; i < 255; i++ {
-		cand = append(cand, i)
-	}
-	rng.Shuffle(len(cand), func(i, j int) { cand[i], cand[j] = cand[j], cand[i] })
-	for _, i := range cand {
-		if len(out) >= max {
-			break
-		}
-		ip := net.IPv4(v4[0], v4[1], v4[2], byte(i)).String()
-		if seen[ip] {
-			continue
-		}
-		if echHandshakeOK(ip, name, 1500*time.Millisecond) {
-			add(ip)
+		v4 := net.ParseIP(reachable[0]).To4()
+		if v4 != nil {
+			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+			var cand []int
+			for i := 1; i < 255; i++ {
+				cand = append(cand, i)
+			}
+			rng.Shuffle(len(cand), func(i, j int) { cand[i], cand[j] = cand[j], cand[i] })
+			// 采样最多 12 个并发探测
+			limit := 12
+			if limit > len(cand) {
+				limit = len(cand)
+			}
+			type sres struct {
+				ip string
+				ok bool
+			}
+			sch := make(chan sres, limit)
+			for _, i := range cand[:limit] {
+				ip := net.IPv4(v4[0], v4[1], v4[2], byte(i)).String()
+				if seen[ip] {
+					continue
+				}
+				go func(ip string) {
+					sch <- sres{ip, echHandshakeOK(ip, name, 1500*time.Millisecond)}
+				}(ip)
+			}
+			for range cand[:limit] {
+				s := <-sch
+				if s.ok && !seen[s.ip] && len(out) < max {
+					add(s.ip)
+				}
+			}
 		}
 	}
 	return out
@@ -621,7 +656,17 @@ func forceRewriteA(resp *dns.Msg, name string) {
 	var hintIPs []string
 	if official := officialCFIPv4s(resp); len(official) > 0 {
 		hintIPs = officialSubnetIPs(official, name, 6)
-		slog("%s: FORCED A -> official-subnet(ECH-probed) %v", name, hintIPs)
+		if len(hintIPs) == 0 {
+			// 2026-08-15: 探测全失败 → 兜底给原始官方 IP（宁可慢不空手，
+			// Firefox 拿到空 A 列表立即 loadError，后续探测结果也白搭）
+			hintIPs = official
+			if len(hintIPs) > 6 {
+				hintIPs = hintIPs[:6]
+			}
+			slog("%s: ECH probe all failed, fallback raw official %v", name, hintIPs)
+		} else {
+			slog("%s: FORCED A -> official-subnet(ECH-probed) %v", name, hintIPs)
+		}
 	} else {
 		hintIPs = fetchDohEndpointIPv4s()
 		slog("%s: no official CF A, fallback DoH endpoint %v", name, hintIPs)
