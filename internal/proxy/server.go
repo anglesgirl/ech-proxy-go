@@ -133,17 +133,11 @@ func New(cfg *config.Config) *Server {
 		dialer.SetCustomIPs(cfg.ECH.CustomIPs)
 		log.Printf("[proxy] custom edge IPs configured: %s", cfg.ECH.CustomIPs)
 	}
-	// 自动把 DoH 端点的 IP 并入 ECH 握手候选。
-	// 关键洞察(2026-08-13 实测):DoH 端点(如 pieqllv9i7.cloudflare-gateway.com)
-	// 解析到 162.159.36.5/20,属于 Cloudflare AS13335。某些区域(福建)会封禁
-	// 目标站点(archiveofourown.org)解析到的 104.18.x.x 等 CF 边缘 IP,但 DoH
-	// 端点 IP 可达(否则 DoH 都连不上,YouTube 也打不开)。ECH 握手只要连到
-	// 任意一个可达的 AS13335 边缘即可——DoH 端点 IP 天然满足,直接复用。
-	// 用户显式填了 custom_ips 时不覆盖,只做补充。
-	if ips := resolveDoHHostIPs(cfg.DoH); len(ips) > 0 {
-		dialer.AppendCustomIPs(ips)
-		log.Printf("[proxy] auto-added DoH endpoint IPs to ECH candidates: %s", strings.Join(ips, ","))
-	}
+	// ⚠️ 2026-08-15 移除 DoH 端点 IP 并入：162.159.36.x(Gateway 段)不是
+	// 目标域官方段。实测(CO3 05:24 日志): 并发 dial 时 Gateway 段延迟低
+	// 胜出 → 目标站返回 CF 1034(Edge IP Restricted)；同一官方 IP 串行
+	// 使用(如 Han1meViewer)稳定 200。结论：只连目标域官方段, 不连
+	// Gateway 段。CO3 副本已同步移除。
 	// ECH 握手被拒且服务器给了 retry_configs 时,缓存到磁盘供下次直接使用。
 	dialer.SetRetryConfigSink(func(host string, config []byte) {
 		resolver.CacheECHConfig(host, config)
