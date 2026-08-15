@@ -75,14 +75,19 @@ func ProbeCacheLen() int {
 
 // shouldForceCF 决策：域名是否强制走 CF。
 // 1. 静态名单（x.com 全家桶）→ 强制
-// 2. 缓存记录 → 按记录
-// 3. 无记录 → 触发后台探测，先用保守（不强改）
+// 2. 云配置 force_cf 名单（远程可调，见 cloudconfig.go）→ 强制
+// 3. 缓存记录 → 按记录
+// 4. 无记录 → 触发后台探测，先用保守（不强改）
 func shouldForceCF(name string) bool {
 	n := strings.ToLower(name)
 	n = strings.TrimSuffix(n, ".")
 
 	// 静态名单（已实测 CF 有内容）
 	if isForceCF(n) {
+		return true
+	}
+	// 云配置名单（2026-08-15 远程可调，改服务器 JSON 即生效，零出包）
+	if cloudForceCF(n) {
 		return true
 	}
 

@@ -42,6 +42,7 @@ var (
 )
 
 // SetOverride 设置域名→IP 强制覆盖（逗号/换行分隔多条："x.com=162.159.140.229"）。
+// 支持多 IP："x.com=172.64.146.66,104.18.41.190"（A 记录返回多个，Firefox 挨个试）。
 // 热更新：DNS 查询实时生效，无需重启。
 func SetOverride(s string) {
 	overrideMu.Lock()
@@ -139,6 +140,10 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 
 	// 后台扫描 CF IP 段找可达边缘（进轮换池，解决单一 IP 抖动）
 	StartScanCFIPs(64)
+
+	// 云配置：从 doh.anglesgirl.eu.org TXT 拉取 overrides/force/pool
+	// （2026-08-15 用户要求：改 IP 改 DNS 记录即可，零出包）
+	StartCloudConfig()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", handleDoH)
@@ -271,18 +276,37 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	if ip, ok := matchOverride(q.Name); ok {
 		switch q.Qtype {
 		case dns.TypeA:
-			resp.Answer = []dns.RR{&dns.A{
-				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
-				A:   net.ParseIP(ip),
-			}}
-			slog("%s: OVERRIDE A -> %s", q.Name, ip)
+			// 支持多 IP（逗号分隔）：返回多个 A 记录，Firefox 挨个试
+			ips := strings.Split(ip, ",")
+			var ans []dns.RR
+			seen := map[string]bool{}
+			for _, s := range ips {
+				s = strings.TrimSpace(s)
+				p := net.ParseIP(s)
+				if p == nil || seen[s] {
+					continue
+				}
+				seen[s] = true
+				ans = append(ans, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   p,
+				})
+			}
+			if len(ans) == 0 {
+				// 非法 IP：返回空，别给 Firefox 无效地址
+				slog("%s: OVERRIDE A -> invalid ip %q", q.Name, ip)
+				resp.Answer = nil
+			} else {
+				resp.Answer = ans
+				slog("%s: OVERRIDE A -> %v", q.Name, ips)
+			}
 		case dns.TypeAAAA:
 			resp.Answer = nil
 			slog("%s: OVERRIDE AAAA -> empty", q.Name)
 		case dns.TypeHTTPS:
-			// 注入 ech= + ipv4hint=override IP：A 与 HTTPS 指向同一 IP，
+			// 注入 ech= + ipv4hint=override IP 列表：A 与 HTTPS 指向同一批 IP，
 			// Firefox 走 ECH 隐藏 SNI（见 injectECHWithHints）。
-			injectECHWithHints(resp, q.Name, []string{ip})
+			injectECHWithHints(resp, q.Name, strings.Split(ip, ","))
 			slog("%s: OVERRIDE HTTPS -> ech= + hint=%s", q.Name, ip)
 		}
 		writeResponse(w, resp)
@@ -1075,8 +1099,12 @@ func fetchDohEndpointIPv4s() []string {
 		}
 	}
 
-	// 优先级：用户实测 12 个（最可信）> 扫描池 > 内置快照
+	// 优先级：用户实测 12 个（最可信）> 云配置 pool > 扫描池 > 内置快照
 	// 用户 2026-08-14 大陆实测可达列表（Firefox 会先试这些）
+	// 云配置 pool（2026-08-15：远程 TXT 下发优选 IP，如 wto.org 段 172.64.146.66）
+	for _, ip := range cloudPoolIPs() {
+		add(ip)
+	}
 	for _, ip := range []string{
 		"104.17.16.197", "104.19.43.13", "104.19.2.117",
 		"172.64.52.66", "108.162.193.202", "172.64.53.55",
