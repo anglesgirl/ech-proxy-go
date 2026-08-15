@@ -286,7 +286,7 @@ class MainActivity : AppCompatActivity() {
             }
             .exceptionally { e: Throwable ->
                 log("EXT", "twimg-rewrite install failed: $e")
-                null
+                null as WebExtension? // 显式类型：GeckoResult<WebExtension?> 的失败路径
             }
     }
 
