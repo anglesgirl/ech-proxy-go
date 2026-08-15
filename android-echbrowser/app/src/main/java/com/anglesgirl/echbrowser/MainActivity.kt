@@ -278,15 +278,16 @@ class MainActivity : AppCompatActivity() {
      *  失败不影响主流程 —— 只是资源缺失，不该让浏览器起不来。 */
     private fun installTwimgRewrite() {
         val rt = runtime ?: return
-        // installBuiltIn 返回 GeckoResult<WebExtension?>：ext 可能为 null，
-        // exceptionally 的 listener 返回类型与 T 一致（WebExtension?）。
+        // GeckoView GeckoResult.accept 的 listener 签名是 (value, error)：
+        // 成功和失败都在 accept 里处理，无需链 exceptionally（它的 listener
+        // 要返回 GeckoResult<U>，裸值不匹配，编译会报泛型推断错误）。
         rt.webExtensionController.installBuiltIn("resource://android/assets/twimg-rewrite/")
-            .accept { ext: WebExtension? ->
-                log("EXT", "twimg-rewrite installed: ${ext?.id}")
-            }
-            .exceptionally { e: Throwable ->
-                log("EXT", "twimg-rewrite install failed: $e")
-                null as WebExtension? // 显式类型：GeckoResult<WebExtension?> 的失败路径
+            .accept { ext: WebExtension?, err: Throwable? ->
+                if (err != null) {
+                    log("EXT", "twimg-rewrite install failed: $err")
+                } else {
+                    log("EXT", "twimg-rewrite installed: ${ext?.id}")
+                }
             }
     }
 
