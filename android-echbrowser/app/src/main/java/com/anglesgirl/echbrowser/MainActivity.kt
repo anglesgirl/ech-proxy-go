@@ -44,6 +44,8 @@ class MainActivity : AppCompatActivity() {
     private val DOH_PORT = "8443"
     private val DOH_URI = "https://$DOH_DOMAIN:$DOH_PORT/dns-query"
     private val logFile by lazy { File(filesDir, "echbrowser.log") }
+    /** 目标首页（自动加载用；onLocationChange 会污染 urlBar，不能读它） */
+    private var pendingUrl = "https://x.com"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         log("APP", "onCreate ENTER")
@@ -119,7 +121,7 @@ class MainActivity : AppCompatActivity() {
             this.text = text
             setOnClickListener { click() }
         }
-        bar.addView(button("打开") { loadUrl() })
+        bar.addView(button("打开") { loadUrlFromBar() })
         bar.addView(button("日志") { showLogs() })
         root.addView(bar)
 
@@ -373,7 +375,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadUrl() {
-        val raw = urlBar.text.toString().trim()
+        // 自动加载固定用首页（2026-08-15：onLocationChange 会把 urlBar
+        // 覆盖成初始 about:blank，等 DoH 的 loadUrl 读到它 → MALFORMED_URI）
+        val raw = pendingUrl
         val url = if (raw.startsWith("http")) raw else "https://$raw"
         log("USER", "load=$url")
         try {
@@ -381,6 +385,12 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Throwable) {
             log("USER", "load FAILED: $e")
         }
+    }
+
+    /** 用户点「打开」：读输入框内容（含手动输入的 URL）。 */
+    private fun loadUrlFromBar() {
+        pendingUrl = urlBar.text.toString().trim()
+        loadUrl()
     }
 
     private fun log(tag: String, msg: String) {
