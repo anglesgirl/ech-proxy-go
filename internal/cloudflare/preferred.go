@@ -212,5 +212,5 @@ func ScanPreferredIPs(n int, budget time.Duration) []string {
 	if remain < timeout {
 		timeout = remain
 	}
-	return SpeedScanIPs(ips, n, 64, timeout)
+	return SpeedScanIPs(ips, n, 16, timeout)
 }
