@@ -281,7 +281,20 @@ class MainActivity : AppCompatActivity() {
         // GeckoResult.accept(Consumer<T>, Consumer<Throwable>)：两个独立的
         // Consumer 参数，分别处理成功和失败。不用 exceptionally（它的
         // listener 要返回 GeckoResult<U>，裸值不匹配）。
-        rt.webExtensionController.installBuiltIn("resource://android/assets/twimg-rewrite/")
+        val controller = rt.webExtensionController
+        // 扩展消息 → echbrowser.log（诊断：background 是否运行、拦截是否触发）
+        // MessageDelegate.onMessage(nativeApp, message, sender)：message 是
+        // 扩展 sendMessage 的 JS 对象，GeckoView 侧序列化为 org.json.JSONObject。
+        controller.setMessageDelegate(
+            { nativeApp: String, message: Any?, _: WebExtension.MessageSender ->
+                if (nativeApp == "twimg-rewrite@anglesgirl.local" && message is org.json.JSONObject) {
+                    log("EXT", "[twimg-rewrite] ${message.optString("msg")}")
+                }
+                null
+            },
+            "twimg-rewrite@anglesgirl.local"
+        )
+        controller.installBuiltIn("resource://android/assets/twimg-rewrite/")
             .accept(
                 { ext: WebExtension? ->
                     log("EXT", "twimg-rewrite installed: ${ext?.id}")

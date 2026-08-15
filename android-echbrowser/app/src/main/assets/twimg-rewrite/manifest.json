@@ -13,6 +13,7 @@
   "permissions": [
     "webRequest",
     "webRequestBlocking",
+    "nativeMessaging",
     "*://*.twimg.com/*"
   ],
 
