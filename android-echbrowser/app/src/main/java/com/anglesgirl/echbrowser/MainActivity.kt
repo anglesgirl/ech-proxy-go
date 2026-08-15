@@ -109,6 +109,7 @@ class MainActivity : AppCompatActivity() {
         actions.addView(button("后退") { session.goBack() })
         actions.addView(button("前进") { session.goForward() })
         actions.addView(button("刷新") { session.reload() })
+        actions.addView(button("IP设置") { showOverrideDialog() })
         actions.addView(button("导出") { exportLogs() })
         root.addView(actions)
 
@@ -129,6 +130,18 @@ class MainActivity : AppCompatActivity() {
         Thread {
             try {
                 log("DOH", "reading certs...")
+                // 手动 IP 覆盖（2026-08-15 用户要求）：启动时应用上次保存的
+                // "域名=IP" 规则，不用等构建直接测试任意 IP。
+                try {
+                    val saved = getSharedPreferences("echbrowser", MODE_PRIVATE)
+                        .getString("override", "") ?: ""
+                    if (saved.isNotBlank()) {
+                        com.anglesgirl.echbrowser.echdoh.Echdoh.setOverride(saved.replace("\n", ","))
+                        log("DOH", "override loaded: $saved")
+                    }
+                } catch (e: Throwable) {
+                    log("DOH", "override load failed: ${e.message}")
+                }
                 // 加载域名探测缓存（可强改名单自动学习）
                 try {
                     com.anglesgirl.echbrowser.echdoh.Echdoh.loadProbeCache(
@@ -253,6 +266,44 @@ class MainActivity : AppCompatActivity() {
             log("GECKO", "FAILED: $e")
             runOnUiThread { status.text = "❌ GeckoView 失败: ${e.message}" }
         }
+    }
+
+    /** 手动 IP 覆盖对话框（2026-08-15 用户要求）：输"域名=IP"每行一条，
+     *  应用后热更新（无需重启），下次启动自动加载。测试任意 IP 不用等构建。 */
+    private fun showOverrideDialog() {
+        val prefs = getSharedPreferences("echbrowser", MODE_PRIVATE)
+        val input = EditText(this).apply {
+            setText(prefs.getString("override", "") ?: "")
+            hint = "域名=IP，每行一条\n例如：\nx.com=162.159.140.229"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            gravity = Gravity.TOP
+            setSingleLine(false)
+            minLines = 4
+        }
+        AlertDialog.Builder(this)
+            .setTitle("手动 IP 覆盖")
+            .setView(input)
+            .setPositiveButton("应用") { _, _ ->
+                val v = input.text.toString().trim()
+                prefs.edit().putString("override", v).apply()
+                try {
+                    com.anglesgirl.echbrowser.echdoh.Echdoh.setOverride(v.replace("\n", ","))
+                    log("DOH", "override applied: $v")
+                    Toast.makeText(this, "已应用，刷新页面生效", Toast.LENGTH_SHORT).show()
+                } catch (e: Throwable) {
+                    Toast.makeText(this, "应用失败: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("清空", { _, _ ->
+                prefs.edit().remove("override").apply()
+                try {
+                    com.anglesgirl.echbrowser.echdoh.Echdoh.setOverride("")
+                    Toast.makeText(this, "已清空覆盖", Toast.LENGTH_SHORT).show()
+                } catch (_: Throwable) {}
+            })
+            .setNeutralButton("取消", null)
+            .show()
     }
 
     private fun loadUrl() {

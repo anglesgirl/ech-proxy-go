@@ -35,6 +35,52 @@ var (
 	srv      *http.Server
 	running  bool
 	upstream []string
+	// 手动 IP 覆盖（2026-08-15 用户要求）：域名=IP 强制改写 A 记录，
+	// 不用等构建直接测试任意 IP（如 x.com=162.159.140.229）。
+	overrideMu sync.Mutex
+	overrideMap = map[string]string{}
+)
+
+// SetOverride 设置域名→IP 强制覆盖（逗号/换行分隔多条："x.com=162.159.140.229"）。
+// 热更新：DNS 查询实时生效，无需重启。
+func SetOverride(s string) {
+	overrideMu.Lock()
+	defer overrideMu.Unlock()
+	overrideMap = map[string]string{}
+	for _, line := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' }) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(parts[0]), "."))
+			ip := strings.TrimSpace(parts[1])
+			if host != "" && ip != "" {
+				overrideMap[host] = ip
+			}
+		}
+	}
+	slog("override set: %d rule(s)", len(overrideMap))
+}
+
+// matchOverride 精确或子域匹配（x.com 规则同时覆盖 api.x.com / abs.twimg.com 等）。
+func matchOverride(name string) (string, bool) {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	overrideMu.Lock()
+	defer overrideMu.Unlock()
+	if ip, ok := overrideMap[name]; ok {
+		return ip, true
+	}
+	for k, ip := range overrideMap {
+		if strings.HasSuffix(name, "."+k) {
+			return ip, true
+		}
+	}
+	return "", false
+}
+
+var (
 	lastErr  string
 	logBuf   []string // Go 侧日志缓冲（Kotlin 轮询拉取）
 	logBufMu sync.Mutex
@@ -214,6 +260,30 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Id = req.Id
+
+	// 手动 IP 覆盖（最高优先，2026-08-15）：用户指定的 域名=IP 直接返回，
+	// 不走上游/强制改写/注入。AAAA 覆盖域名清空（强制 IPv4）。
+	if ip, ok := matchOverride(q.Name); ok {
+		if q.Qtype == dns.TypeA {
+			resp.Answer = []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.ParseIP(ip),
+			}}
+			slog("%s: OVERRIDE A -> %s", q.Name, ip)
+		} else if q.Qtype == dns.TypeAAAA {
+			resp.Answer = nil
+			slog("%s: OVERRIDE AAAA -> empty", q.Name)
+		}
+		out, err := resp.Pack()
+		if err != nil {
+			http.Error(w, "pack failed", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.Write(out)
+		return
+	}
 
 	// 强制改写名单：x.com 全家桶（已实测 CF 上有完整内容，DNS 轮询
 	// 在 CF/Fastly 间切换，必须无条件强注强改，否则拿到 Fastly IP 时
