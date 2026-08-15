@@ -719,17 +719,27 @@ func forcedHintIPs(name string, official []string, max int) []string {
 			out, src = ips, "reachable-pool(ECH-probed)"
 		}
 	}
-	// 最后兜底：可达池原样（TCP 层已验证可达，只是 ECH 未探测通过）。
-	// 绝不回退到刚被探测判定 ECH 不可用的官方 IP —— 注意内置池快照里
-	// 本身就含官方 IP（如 162.159.140.229），必须显式剔除已知失败的。
-	if len(out) == 0 && len(pool) > 0 {
-		raw := excludeECHFailed(pool, name, max)
-		if len(raw) > 0 {
-			out, src = raw, "reachable-pool(raw, ECH unprobed)"
-		}
-	}
+	// ⚠️ 没有第三级「可达池原样」兜底 —— fail-closed。
+	//
+	// 2026-08-15 abs-0.twimg.com 实测：官方段 + 可达池共 16 个 IP 的 ECH
+	// 探测全部 false。xprobe 单独验证：连 CF 边缘直接
+	// `remote error: tls: handshake failure`，连官方 IP 则证书是
+	// *.twimg.com 而非 cloudflare-ech.com —— **CF 上根本没有这个域名的
+	// 配置**（它走 Fastly：x-tw-cdn: FT，CNAME abs-zero.twimg.com →
+	// 104.244.43.131 Twitter 自有段）。
+	//
+	// 旧代码此时塞 6 个无关 CF IP，ECH 必然失败；而回退原始解析等于
+	// 明文 SNI 直连被墙 CDN —— 两条路都错。用户拍板：宁可资源加载失败，
+	// 绝不暴露 SNI。返回 nil → 调用方给空 A 记录（fail-closed，
+	// 与 AGENTS.md 1.3.3 种子兜底同原则）。
+	//
+	// 判据是**探测结果本身**，不是「域名在不在 CF」：abs/pbs.twimg.com
+	// 的 DNS 同样指向 Fastly，但 CF 边缘用 cloudflare-ech.com 证书接受
+	// ECH（探测 true）→ 强改成立。同一 *.twimg.com 通配下两种结果，
+	// 只能靠探测区分。规则统一后，X 换域名不需要改代码。
 	if len(out) == 0 {
-		slog("%s: no forced hint IPs available (official=%v pool empty)", name, official)
+		slog("%s: ECH probe failed on all candidates (official=%v) "+
+			"-> CF 无此域名配置，返回空 A（fail-closed，不暴露 SNI）", name, official)
 		return nil
 	}
 
@@ -737,24 +747,6 @@ func forcedHintIPs(name string, official []string, max int) []string {
 	forcedHintCache[key] = forcedHintEntry{ips: out, ts: time.Now()}
 	forcedHintMu.Unlock()
 	slog("%s: forced hint IPs <- %s %v", name, src, out)
-	return out
-}
-
-// excludeECHFailed 从候选里剔除「探测缓存已记录 ECH 失败」的 IP，
-// 保留未探测过或探测成功的（最多 max 个）。
-func excludeECHFailed(pool []string, host string, max int) []string {
-	echTestMu.Lock()
-	defer echTestMu.Unlock()
-	var out []string
-	for _, ip := range pool {
-		if e, ok := echTestCache[host+"|"+ip]; ok && !e.ok {
-			continue // 已知 ECH 不可用
-		}
-		out = append(out, ip)
-		if len(out) >= max {
-			break
-		}
-	}
 	return out
 }
 
@@ -813,14 +805,14 @@ func officialCFIPv4s(resp *dns.Msg) []string {
 	return out
 }
 
-// forceRewriteA 无条件把 A 记录改写为 forcedHintIPs()（ECH 已验证优先，
-// 绝不回退到探测失败的官方 IP —— 见 forcedHintIPs 注释）。
+// forceRewriteA 把 A 记录改写为 forcedHintIPs()（ECH 已验证的 CF 边缘）。
+//
+// forcedHintIPs 返回空 = 所有候选 ECH 探测失败 = CF 上没有该域名配置。
+// 此时**清空 A 记录**（fail-closed），不保留原始解析 —— 保留就等于让
+// Firefox 明文 SNI 直连该域名的真实 CDN（如 abs-0.twimg.com → Fastly），
+// SNI 泄漏。用户拍板：宁可资源加载失败，绝不暴露 SNI。
 func forceRewriteA(resp *dns.Msg, name string) {
 	hintIPs := forcedHintIPs(name, officialCFIPv4s(resp), 6)
-	if len(hintIPs) == 0 {
-		slog("%s: forceRewriteA no candidates, keep original answers", name)
-		return
-	}
 	newAnswers := make([]dns.RR, 0, len(hintIPs))
 	for _, rr := range resp.Answer {
 		switch rr.(type) {
@@ -829,6 +821,12 @@ func forceRewriteA(resp *dns.Msg, name string) {
 		default:
 			newAnswers = append(newAnswers, rr)
 		}
+	}
+	if len(hintIPs) == 0 {
+		// 原 A/CNAME 已被丢弃，这里不补任何 A → 空答案（NODATA）。
+		resp.Answer = newAnswers
+		slog("%s: A cleared (ECH unavailable on CF, fail-closed 防 SNI 泄漏)", name)
+		return
 	}
 	seen := map[string]bool{}
 	added := 0
@@ -869,6 +867,14 @@ func injectECHForced(resp *dns.Msg, name string) {
 	// ipv4hint 与 A 记录用同一批候选（forcedHintIPs），避免两条路径连
 	// 不同 IP：A 记录给 ECH 已验证 IP、hint 给可达池 → Firefox 行为不定。
 	hintIPs := forcedHintIPs(name, nil, 6)
+	if len(hintIPs) == 0 {
+		// ECH 探测全失败 = CF 无此域名配置。注入 ech= 只会让 Firefox 拿着
+		// 无效配置去握手；A 记录那边已 fail-closed 清空，这里同样不注入，
+		// 保持两条路径一致（见 forceRewriteA / forcedHintIPs 注释）。
+		resp.Answer = nil
+		slog("%s: HTTPS cleared (ECH unavailable on CF, fail-closed 防 SNI 泄漏)", name)
+		return
+	}
 	svcb := &dns.SVCB{
 		Hdr:      dns.RR_Header{Name: name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 300},
 		Priority: 1,
@@ -878,19 +884,17 @@ func injectECHForced(resp *dns.Msg, name string) {
 			&dns.SVCBAlpn{Alpn: []string{"http/1.1"}},
 		},
 	}
-	if len(hintIPs) > 0 {
-		hints := make([]net.IP, 0, 6)
-		for _, h := range hintIPs {
-			if ip := net.ParseIP(h); ip != nil {
-				hints = append(hints, ip)
-				if len(hints) >= 6 {
-					break
-				}
+	hints := make([]net.IP, 0, 6)
+	for _, h := range hintIPs {
+		if ip := net.ParseIP(h); ip != nil {
+			hints = append(hints, ip)
+			if len(hints) >= 6 {
+				break
 			}
 		}
-		if len(hints) > 0 {
-			svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: hints})
-		}
+	}
+	if len(hints) > 0 {
+		svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: hints})
 	}
 	resp.Answer = []dns.RR{svcb}
 	slog("FORCED ech= into HTTPS record for %s (%d bytes, hints=%v)", name, len(echConfig), hintIPs[:min(6, len(hintIPs))])
@@ -975,13 +979,20 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 		return
 	}
 
-	// 2026-08-15: 官方 CF IP 同 /24 段优先（信誉与官方同级，规避 403）；
-	// 无官方 IP（理论不发生，前面已验证 AS13335）才回退 DoH 端点 IP。
-	hintIPs := officialSubnetIPs(ips, name, 6)
+	// 2026-08-15: 走 forcedHintIPs 复用 5min 结果缓存 + 单飞。
+	//
+	// 旧代码直接调 officialSubnetIPs()，该函数无结果缓存 —— 手机日志实测
+	// challenges.cloudflare.com（CF 人机验证窗口）每次 DNS 查询都重探
+	// 40+ 个 172.64.146.x，20:29:19/21/30/58、20:30:00 反复重复，验证窗口
+	// 因此明显变慢。另外兜底 fetchDohEndpointIPv4s() 未截断，曾一次吐出
+	// 32 条 A 记录，Firefox 要挨个试。
+	//
+	// forcedHintIPs 同时带来 fail-closed 语义：ECH 探测全失败 → 返回空 →
+	// 这里保持原样不改写（本函数只在 AllAS13335 为真时才走到，域名确实在
+	// CF 上，与 abs-0.twimg.com 那类不同，保留原始解析不会泄漏到墙外 CDN）。
+	hintIPs := forcedHintIPs(name, ips, 6)
 	if len(hintIPs) == 0 {
-		hintIPs = fetchDohEndpointIPv4s()
-	}
-	if len(hintIPs) == 0 {
+		slog("%s: ECH probe failed on all candidates, keep original A=%v", name, ips)
 		return
 	}
 	newAnswers := make([]dns.RR, 0, len(resp.Answer)+len(hintIPs))

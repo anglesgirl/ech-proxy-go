@@ -77,6 +77,34 @@ func TestForcedHintIPsCaches(t *testing.T) {
 	}
 }
 
+// fail-closed 回归：所有候选 ECH 探测失败时必须返回空，绝不回退到
+// 「可达但 ECH 未验证」的 IP。
+//
+// 2026-08-15 abs-0.twimg.com 实测：官方段 + 可达池 16 个 IP 探测全 false
+// （xprobe 验证 CF 边缘直接 handshake failure —— CF 上没有该域名配置）。
+// 旧代码第三级兜底塞 6 个无关 CF IP；若改成保留原始解析则是明文 SNI
+// 直连 Fastly。两条都错，只能返回空让调用方清空 A 记录。
+func TestForcedHintIPsFailsClosedWhenECHUnavailable(t *testing.T) {
+	resetForcedHintState()
+
+	const name = "abs-0-forcedhint.test"
+	official := []string{"104.244.43.131"}
+
+	pool := fetchDohEndpointIPv4s()
+	if len(pool) == 0 {
+		t.Skip("no reachable pool IPs available in this environment")
+	}
+	// 池子 + 官方 + 官方 /24 段：全部标记 ECH 失败
+	seedECHCache(name, pool, false)
+	seedSubnet24(name, official, false)
+	seedECHCache(name, official, false)
+
+	got := forcedHintIPs(name, official, 6)
+	if len(got) != 0 {
+		t.Errorf("expected empty (fail-closed) but got %v — 会导致 SNI 泄漏或无效 CF IP", got)
+	}
+}
+
 // ── 测试辅助 ──────────────────────────────────────────────
 
 func resetForcedHintState() {
