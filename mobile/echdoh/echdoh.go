@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -405,9 +406,76 @@ func isForceCF(name string) bool {
 	return false
 }
 
-// forceRewriteA 无条件把 A 记录改写为 DoH 端点 IP（不判断 CF）。
+// officialSubnetIPs 从官方解析 CF IP 生成候选：官方 IP 优先（最多 3 个），
+// 再从第一个官方 IP 的 /24 段随机采样补足到 max 个。
+// 2026-08-15 用户观点落地：CF 任播下官方 IP 所在 C 段内其他 IP 信誉与
+// 官方同级（风控不区分），可以随便换；而改写为 DoH 端点 IP（Gateway 段
+// 162.159.36.x）会让 CF 看到"目标域流量来自非官方段"→ 信誉机制 403
+// （x.com 失败根因嫌疑，与 CO3 优选 IP 403 同源）。
+func officialSubnetIPs(official []string, max int) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, ip := range official {
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		out = append(out, ip)
+		if len(out) >= max {
+			return out
+		}
+	}
+	v4 := net.ParseIP(official[0]).To4()
+	if v4 == nil {
+		return out
+	}
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var cand []int
+	for i := 1; i < 255; i++ {
+		cand = append(cand, i)
+	}
+	rng.Shuffle(len(cand), func(i, j int) { cand[i], cand[j] = cand[j], cand[i] })
+	for _, i := range cand {
+		ip := net.IPv4(v4[0], v4[1], v4[2], byte(i)).String()
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		out = append(out, ip)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// officialCFIPv4s 从响应中提取官方解析的 CF（AS13335）IPv4（未改写前的原始值）。
+func officialCFIPv4s(resp *dns.Msg) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, rr := range resp.Answer {
+		if a, ok := rr.(*dns.A); ok {
+			s := a.A.String()
+			if !seen[s] && cloudflare.IsAS13335(s) {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// forceRewriteA 无条件把 A 记录改写为官方 CF IP 同 /24 段（不判断 CF；
+// 无官方 CF IP 时回退 DoH 端点 IP）。
 func forceRewriteA(resp *dns.Msg, name string) {
-	hintIPs := fetchDohEndpointIPv4s()
+	var hintIPs []string
+	if official := officialCFIPv4s(resp); len(official) > 0 {
+		hintIPs = officialSubnetIPs(official, 6)
+		slog("%s: FORCED A -> official-subnet %v", name, hintIPs)
+	} else {
+		hintIPs = fetchDohEndpointIPv4s()
+		slog("%s: no official CF A, fallback DoH endpoint %v", name, hintIPs)
+	}
 	if len(hintIPs) == 0 {
 		return
 	}
@@ -563,7 +631,12 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 		return
 	}
 
-	hintIPs := fetchDohEndpointIPv4s()
+	// 2026-08-15: 官方 CF IP 同 /24 段优先（信誉与官方同级，规避 403）；
+	// 无官方 IP（理论不发生，前面已验证 AS13335）才回退 DoH 端点 IP。
+	hintIPs := officialSubnetIPs(ips, 6)
+	if len(hintIPs) == 0 {
+		hintIPs = fetchDohEndpointIPv4s()
+	}
 	if len(hintIPs) == 0 {
 		return
 	}
