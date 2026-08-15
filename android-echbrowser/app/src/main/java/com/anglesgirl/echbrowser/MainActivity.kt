@@ -215,6 +215,22 @@ class MainActivity : AppCompatActivity() {
             log("GECKO", "runtime created")
 
             session = GeckoSession()
+            // 页面 console 日志（网页 JS 的 console.error/warn）→ echbrowser.log，
+            // 排查 x.com 前端资源加载失败/脚本报错最直接（2026-08-15 用户要求
+            // 「页面日志也开出来」）。只记 warn/error 防刷屏。
+            session.contentDelegate = object : GeckoSession.ContentDelegate {
+                override fun onConsoleMessage(
+                    s: GeckoSession,
+                    message: GeckoSession.ContentDelegate.ConsoleMessage
+                ) {
+                    val lvl = message.logLevel()
+                    if (lvl == GeckoSession.ContentDelegate.ConsoleMessage.Level.ERROR ||
+                        lvl == GeckoSession.ContentDelegate.ConsoleMessage.Level.WARN
+                    ) {
+                        log("PAGE-CONSOLE", "[$lvl] ${message.message()}")
+                    }
+                }
+            }
             session.navigationDelegate = object : GeckoSession.NavigationDelegate {
                 override fun onLocationChange(
                     session: GeckoSession,
