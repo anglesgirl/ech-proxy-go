@@ -278,17 +278,18 @@ class MainActivity : AppCompatActivity() {
      *  失败不影响主流程 —— 只是资源缺失，不该让浏览器起不来。 */
     private fun installTwimgRewrite() {
         val rt = runtime ?: return
-        // GeckoView GeckoResult.accept 的 listener 签名是 (value, error)：
-        // 成功和失败都在 accept 里处理，无需链 exceptionally（它的 listener
-        // 要返回 GeckoResult<U>，裸值不匹配，编译会报泛型推断错误）。
+        // GeckoResult.accept(Consumer<T>, Consumer<Throwable>)：两个独立的
+        // Consumer 参数，分别处理成功和失败。不用 exceptionally（它的
+        // listener 要返回 GeckoResult<U>，裸值不匹配）。
         rt.webExtensionController.installBuiltIn("resource://android/assets/twimg-rewrite/")
-            .accept { ext: WebExtension?, err: Throwable? ->
-                if (err != null) {
-                    log("EXT", "twimg-rewrite install failed: $err")
-                } else {
+            .accept(
+                { ext: WebExtension? ->
                     log("EXT", "twimg-rewrite installed: ${ext?.id}")
+                },
+                { e: Throwable ->
+                    log("EXT", "twimg-rewrite install failed: $e")
                 }
-            }
+            )
     }
 
     /** 手动 IP 覆盖对话框（2026-08-15 用户要求）：输"域名=IP"每行一条，
