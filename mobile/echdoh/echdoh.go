@@ -261,18 +261,29 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Id = req.Id
 
-	// 手动 IP 覆盖（最高优先，2026-08-15）：用户指定的 域名=IP 直接返回，
-	// 不走上游/强制改写/注入。AAAA 覆盖域名清空（强制 IPv4）。
+	// 手动 IP 覆盖（最高优先，2026-08-15）：用户指定的 域名=IP 直接返回。
+	// A 记录返回指定 IP；HTTPS 查询同样注入 ech= + ipv4hint=指定 IP ——
+	// 2026-08-15 实测修复：旧代码只处理 A/AAAA，HTTPS 落到 forced-CF 分支
+	// 注入的 hints 与 A 记录不一致，且用户指定 IP 若不在探测池里 Firefox
+	// 会用明文 SNI 直连 → 被墙（loadError 0x93 NETWORK）。
+	// 手动指定 IP + ECH 才能既用用户想要的 IP 又隐藏 SNI。
+	// AAAA 覆盖域名清空（强制 IPv4）。
 	if ip, ok := matchOverride(q.Name); ok {
-		if q.Qtype == dns.TypeA {
+		switch q.Qtype {
+		case dns.TypeA:
 			resp.Answer = []dns.RR{&dns.A{
 				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
 				A:   net.ParseIP(ip),
 			}}
 			slog("%s: OVERRIDE A -> %s", q.Name, ip)
-		} else if q.Qtype == dns.TypeAAAA {
+		case dns.TypeAAAA:
 			resp.Answer = nil
 			slog("%s: OVERRIDE AAAA -> empty", q.Name)
+		case dns.TypeHTTPS:
+			// 注入 ech= + ipv4hint=override IP：A 与 HTTPS 指向同一 IP，
+			// Firefox 走 ECH 隐藏 SNI（见 injectECHWithHints）。
+			injectECHWithHints(resp, q.Name, []string{ip})
+			slog("%s: OVERRIDE HTTPS -> ech= + hint=%s", q.Name, ip)
 		}
 		writeResponse(w, resp)
 		return
@@ -861,6 +872,16 @@ func forceRewriteA(resp *dns.Msg, name string) {
 
 // injectECHForced 无条件注入 CF 公共 ECH 公钥（不判断是否 CF 托管）。
 func injectECHForced(resp *dns.Msg, name string) {
+	// ipv4hint 与 A 记录用同一批候选（forcedHintIPs），避免两条路径连
+	// 不同 IP：A 记录给 ECH 已验证 IP、hint 给可达池 → Firefox 行为不定。
+	hintIPs := forcedHintIPs(name, nil, 6)
+	injectECHWithHints(resp, name, hintIPs)
+}
+
+// injectECHWithHints 用指定 hint IPs 注入 CF 公共 ECH 公钥。
+// hintIPs 为空（ECH 探测全失败 / 无候选）时清空 HTTPS 记录（fail-closed，
+// 与 forceRewriteA 一致 —— 见 forcedHintIPs 注释）。
+func injectECHWithHints(resp *dns.Msg, name string, hintIPs []string) {
 	for _, rr := range resp.Answer {
 		for _, kv := range svcbValues(rr) {
 			if _, isECH := kv.(*dns.SVCBECHConfig); isECH {
@@ -873,9 +894,6 @@ func injectECHForced(resp *dns.Msg, name string) {
 		slog("%s: no CF public ECH key available, skip forced inject", name)
 		return
 	}
-	// ipv4hint 与 A 记录用同一批候选（forcedHintIPs），避免两条路径连
-	// 不同 IP：A 记录给 ECH 已验证 IP、hint 给可达池 → Firefox 行为不定。
-	hintIPs := forcedHintIPs(name, nil, 6)
 	if len(hintIPs) == 0 {
 		// ECH 探测全失败 = CF 无此域名配置。注入 ech= 只会让 Firefox 拿着
 		// 无效配置去握手；A 记录那边已 fail-closed 清空，这里同样不注入，
