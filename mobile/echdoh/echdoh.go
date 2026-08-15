@@ -724,9 +724,9 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 				cand = append(cand, i)
 			}
 			rng.Shuffle(len(cand), func(i, j int) { cand[i], cand[j] = cand[j], cand[i] })
-			// 采样最多 6 个并发探测（2026-08-15 优化：原 12 个，手机日志
-			// 实测每个域名探测 16-20 个 IP 太浪费 —— 6 个采样 + 官方 IP
-			// 足够选出可用段，探测数量减半、速度翻倍）
+			// 采样最多 6 个并发探测；**第一个 ok 立即返回**（2026-08-16
+			// 用户要求：有一个可用直接用，后续没必要测 —— 不等满 max，
+			// 冷启动从 ~12s 压到 ~2s）
 			limit := 6
 			if limit > len(cand) {
 				limit = len(cand)
@@ -736,23 +736,24 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 				ok bool
 			}
 			sch := make(chan sres, limit)
+			launched := 0
 			for _, i := range cand[:limit] {
 				ip := net.IPv4(v4[0], v4[1], v4[2], byte(i)).String()
 				if seen[ip] {
 					continue
 				}
+				launched++
 				go func(ip string) {
 					sch <- sres{ip, echHandshakeOK(ip, name, 3*time.Second)}
 				}(ip)
 			}
-			for range cand[:limit] {
+			// 第一个成功即返回（其余 goroutine 写完 chan 后自然退出，
+			// 结果丢弃 —— 探测是幂等的，缓存已写）
+			for range launched {
 				s := <-sch
-				if s.ok && !seen[s.ip] && len(out) < max {
+				if s.ok && !seen[s.ip] {
 					add(s.ip)
-					// 够了就提前返回，不等剩余探测（省时间）
-					if len(out) >= max {
-						return out
-					}
+					return out
 				}
 			}
 		}
@@ -846,19 +847,30 @@ func forcedHintIPs(name string, official []string, max int) []string {
 	// （22:45 该 IP 排第 3 时成功，23:16 排第 1 时失败）。探测 true ≠
 	// Firefox 可用，必须让已验证的官方段 IP 排前面。
 	var poolOut []string
-	for _, ip := range cloudPoolIPs() {
-		echTestMu.Lock()
-		e, cached := echTestCache[name+"|"+ip]
-		echTestMu.Unlock()
-		if cached {
-			if e.ok && time.Since(e.ts) < poolTrueTTL && !containsStr(poolOut, ip) {
-				poolOut = append(poolOut, ip)
+	// 2026-08-16：pool IP 并发探测（原串行最坏 6s → 并发最多 3s）
+	poolIPs := cloudPoolIPs()
+	type pres struct {
+		ip string
+		ok bool
+	}
+	pch := make(chan pres, len(poolIPs))
+	for _, ip := range poolIPs {
+		go func(ip string) {
+			echTestMu.Lock()
+			e, cached := echTestCache[name+"|"+ip]
+			echTestMu.Unlock()
+			if cached {
+				pch <- pres{ip, e.ok && time.Since(e.ts) < poolTrueTTL}
+				return
 			}
-			continue // 缓存命中（无论 ok 与否）不重探
-		}
-		// 无缓存：探测一次，结果落盘（后续 24h 免探）
-		if echHandshakeOK(ip, name, 3*time.Second) && !containsStr(poolOut, ip) {
-			poolOut = append(poolOut, ip)
+			// 无缓存：探测一次，结果落盘（后续 24h 免探）
+			pch <- pres{ip, echHandshakeOK(ip, name, 3*time.Second)}
+		}(ip)
+	}
+	for range poolIPs {
+		r := <-pch
+		if r.ok && !containsStr(poolOut, r.ip) {
+			poolOut = append(poolOut, r.ip)
 		}
 	}
 	if len(poolOut) > 0 {
@@ -963,10 +975,13 @@ func echFilterPool(pool []string, name string, max, probeLimit int) []string {
 		}(ip)
 	}
 	var out []string
+	// 2026-08-16：第一个 ok 即返回（用户要求：一个可用直接用），
+	// 其余 goroutine 写完 chan 自然退出（幂等，缓存已写）
 	for range cands {
 		r := <-ch
-		if r.ok && len(out) < max {
+		if r.ok {
 			out = append(out, r.ip)
+			return out
 		}
 	}
 	return out

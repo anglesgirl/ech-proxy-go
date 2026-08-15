@@ -106,39 +106,36 @@ class MainActivity : AppCompatActivity() {
             fitsSystemWindows = true
         }
 
+        fun button(text: String, click: () -> Unit) = Button(this).apply {
+            this.text = text
+            textSize = 13f
+            setOnClickListener { click() }
+        }
+
+        // 顶部行：后退 | 前进 | 刷新 | 地址栏 | 菜单
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(8, 4, 8, 4)
         }
+        bar.addView(button("←") { session.goBack() })
+        bar.addView(button("→") { session.goForward() })
+        bar.addView(button("⟳") { session.reload() })
         urlBar = EditText(this).apply {
-            hint = "输入网址"
+            hint = "输入网址或搜索"
             setText("https://x.com")
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
             setSingleLine(true)
             setPadding(8, 0, 8, 0)
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_GO
+            setOnEditorActionListener { _, _, _ ->
+                loadUrlFromBar(); true
+            }
         }
         bar.addView(urlBar, LinearLayout.LayoutParams(0, 48, 1f))
-        fun button(text: String, click: () -> Unit) = Button(this).apply {
-            this.text = text
-            setOnClickListener { click() }
-        }
-        bar.addView(button("打开") { loadUrlFromBar() })
-        bar.addView(button("日志") { showLogs() })
+        bar.addView(button("⋮") { showMenu() })
         root.addView(bar)
-
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(8, 0, 8, 4)
-        }
-        actions.addView(button("后退") { session.goBack() })
-        actions.addView(button("前进") { session.goForward() })
-        actions.addView(button("刷新") { session.reload() })
-        actions.addView(button("IP设置") { showOverrideDialog() })
-        actions.addView(button("导出") { exportLogs() })
-        root.addView(actions)
 
         status = TextView(this).apply {
             setTextColor(Color.LTGRAY)
@@ -151,6 +148,48 @@ class MainActivity : AppCompatActivity() {
         geckoView = GeckoView(this)
         root.addView(geckoView, LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(root)
+    }
+
+    /** 浏览器菜单（官方样式：⋮ → 菜单项）。功能收拢，地址栏只留导航。 */
+    private fun showMenu() {
+        val items = arrayOf(
+            "主页",
+            "分享链接",
+            "手动 IP 覆盖",
+            "查看日志",
+            "导出日志",
+            "关于"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("菜单")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> loadUrl() // 主页（pendingUrl）
+                    1 -> shareUrl()
+                    2 -> showOverrideDialog()
+                    3 -> showLogs()
+                    4 -> exportLogs()
+                    5 -> AlertDialog.Builder(this)
+                        .setTitle("关于")
+                        .setMessage("ECH 浏览器\nGeckoView 153\nDoH: doh.anglesgirl.eu.org\nECH 改写: MV3 webRequestBlocking")
+                        .setPositiveButton("好", null)
+                        .show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 分享当前页 URL（官方浏览器标准功能）。 */
+    private fun shareUrl() {
+        val url = pendingUrl
+        try {
+            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(android.content.Intent.EXTRA_TEXT, url)
+            }
+            startActivity(android.content.Intent.createChooser(intent, "分享链接"))
+        } catch (_: Throwable) {}
     }
 
     private fun startEchDoh() {
@@ -437,9 +476,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 用户点「打开」：读输入框内容（含手动输入的 URL）。 */
+    /** 用户点「打开」/回车：读输入框内容。非 URL → 搜索（Bing，大陆可用）。 */
     private fun loadUrlFromBar() {
-        pendingUrl = urlBar.text.toString().trim()
+        val raw = urlBar.text.toString().trim()
+        if (raw.isEmpty()) return
+        pendingUrl = when {
+            raw.startsWith("http://") || raw.startsWith("https://") -> raw
+            raw.contains(" ") || !raw.contains(".") ->
+                "https://www.bing.com/search?q=" + android.net.Uri.encode(raw)
+            else -> "https://$raw"
+        }
         loadUrl()
     }
 
