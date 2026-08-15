@@ -213,7 +213,9 @@ function applyRules(url, rules) {
 }
 
 // ── Icon ──────────────────────────────────────────────────────────────────────
+// GeckoView 无 browser.action（manifest 无 action UI），加守卫防报错
 function updateIcon() {
+  if (!browser.action) return;
   const suffix = cachedActive ? 'on' : 'off';
   browser.action.setIcon({
     path: {
@@ -225,7 +227,7 @@ function updateIcon() {
   }).catch(() => {});
   browser.action.setTitle({
     title: cachedActive ? 'URL Modifier — Active' : 'URL Modifier — Inactive'
-  });
+  }).catch(() => {});
 }
 
 // ── Message handler ───────────────────────────────────────────────────────────
