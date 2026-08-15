@@ -2,6 +2,7 @@ package com.anglesgirl.echbrowser
 
 import android.app.Application
 import android.content.ContentValues
+import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -19,6 +20,27 @@ class EchApp : Application() {
     companion object {
         private var publicLogUri: Uri? = null
         private var appCtx: Application? = null
+        // GeckoRuntime 进程级单例（2026-08-16：GeckoView 要求 Application
+        // 层创建一次。之前放 MainActivity 每次 onCreate 重建 → 切后台/
+        // 旋转 Activity 重建时 runtime/cookie 全丢 → 白屏 + 登录掉）
+        @Volatile
+        private var geckoRuntime: org.mozilla.geckoview.GeckoRuntime? = null
+
+        fun runtime(ctx: Context, configFilePath: String? = null): org.mozilla.geckoview.GeckoRuntime {
+            geckoRuntime?.let { return it }
+            synchronized(this) {
+                geckoRuntime?.let { return it }
+                val builder = org.mozilla.geckoview.GeckoRuntimeSettings.Builder()
+                    .consoleOutput(true)
+                if (!configFilePath.isNullOrBlank()) {
+                    builder.configFilePath(configFilePath)
+                }
+                geckoRuntime = org.mozilla.geckoview.GeckoRuntime.create(
+                    ctx.applicationContext, builder.build()
+                )
+                return geckoRuntime!!
+            }
+        }
 
         fun init(ctx: Application) {
             appCtx = ctx

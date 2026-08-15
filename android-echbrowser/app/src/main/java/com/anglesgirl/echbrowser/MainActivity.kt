@@ -18,7 +18,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
-import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
 import org.mozilla.geckoview.WebExtension
@@ -46,11 +45,15 @@ class MainActivity : AppCompatActivity() {
     private val logFile by lazy { File(filesDir, "echbrowser.log") }
     /** 目标首页（自动加载用；onLocationChange 会污染 urlBar，不能读它） */
     private var pendingUrl = "https://x.com"
+    /** 会话状态（官方标准：onSaveInstanceState 保存，重建后 restoreState 恢复） */
+    private var sessionState: GeckoSession.SessionState? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         log("APP", "onCreate ENTER")
         super.onCreate(savedInstanceState)
         log("APP", "onCreate super done")
+        // 官方标准：从 saved state 恢复会话（含当前页+历史，不重新加载）
+        sessionState = savedInstanceState?.getParcelable("session_state")
         buildUi()
         log("APP", "UI built")
         startEchDoh()
@@ -235,17 +238,41 @@ class MainActivity : AppCompatActivity() {
             configFile.writeText(configYaml)
             log("GECKO", "config written: $configYaml")
 
-            val settings = GeckoRuntimeSettings.Builder()
-                .configFilePath(configFile.absolutePath)
-                // 页面 console 输出到 logcat（GeckoConsole tag），
-                // 由 startConsoleCapture 抓进 echbrowser.log
-                .consoleOutput(true)
-                .build()
-            log("GECKO", "creating runtime...")
-            runtime = GeckoRuntime.create(this, settings)
-            log("GECKO", "runtime created")
+            log("GECKO", "runtime: using process singleton (EchApp)")
+            runtime = EchApp.runtime(this, configFile.absolutePath)
+            log("GECKO", "runtime ready (created=${runtime != null})")
 
             session = GeckoSession()
+            // 官方标准：PermissionDelegate（消掉 ContentPermission 报错，
+            // 页面权限请求默认放行 —— x.com 的 clipboard/notification 等）
+            session.permissionDelegate = object : GeckoSession.PermissionDelegate {
+                override fun onContentPermissionRequest(
+                    s: GeckoSession,
+                    perm: GeckoSession.PermissionDelegate.ContentPermission
+                ): GeckoResult<Int> {
+                    return GeckoResult.fromValue(
+                        GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW
+                    )
+                }
+
+                override fun onAndroidPermissionsRequest(
+                    s: GeckoSession,
+                    permissions: Array<out String>,
+                    callback: GeckoSession.PermissionDelegate.Callback
+                ) {
+                    callback.grant()
+                }
+
+                override fun onMediaPermissionRequest(
+                    s: GeckoSession,
+                    uri: String,
+                    video: List<GeckoSession.PermissionDelegate.MediaSource>?,
+                    audio: List<GeckoSession.PermissionDelegate.MediaSource>?,
+                    callback: GeckoSession.PermissionDelegate.MediaCallback
+                ) {
+                    callback.grant(video?.firstOrNull(), audio?.firstOrNull())
+                }
+            }
             session.navigationDelegate = object : GeckoSession.NavigationDelegate {
                 override fun onLocationChange(
                     session: GeckoSession,
@@ -255,6 +282,12 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     log("NAV", "location=$url")
                     runOnUiThread { urlBar.setText(url ?: "") }
+                    // 记住当前页（2026-08-16：Activity 重建时恢复，登录状态
+                    // 由 runtime 单例的 profile/cookie 保留）
+                    if (!url.isNullOrBlank() && url != "about:blank") {
+                        getSharedPreferences("echbrowser", MODE_PRIVATE)
+                            .edit().putString("lastUrl", url).apply()
+                    }
                 }
 
                 override fun onLoadError(
@@ -288,16 +321,30 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     log("TLS", "security=${info.origin} secure=${info.isSecure}")
                 }
+
+                override fun onSessionStateChange(
+                    s: GeckoSession,
+                    state: GeckoSession.SessionState
+                ) {
+                    // 官方标准：保存会话状态供 onSaveInstanceState/恢复
+                    sessionState = state
+                }
             }
 
             log("GECKO", "opening session...")
             session.open(runtime!!)
             geckoView.setSession(session)
-            log("GECKO", "session open, loading")
+            // 扩展每次都要装（恢复会话也不例外，2026-08-16）
             installTwimgRewrite()
-            // 等 DoH 就绪再加载（2026-08-15：竞态 —— DoH 未启动完 Firefox
-            // 就查 TRR，trr.mode=3 无回退 → 每次冷启动开头 code=37 失败）
-            Thread {
+            // 官方标准：恢复会话状态（当前页+历史，不重新加载）或首次加载
+            if (sessionState != null) {
+                log("GECKO", "restoring session state")
+                session.restoreState(sessionState!!)
+            } else {
+                log("GECKO", "session open, loading")
+                // 等 DoH 就绪再加载（2026-08-15：竞态 —— DoH 未启动完 Firefox
+                // 就查 TRR，trr.mode=3 无回退 → 每次冷启动开头 code=37 失败）
+                Thread {
                 var ready = false
                 for (i in 0..19) {
                     try {
@@ -312,6 +359,7 @@ class MainActivity : AppCompatActivity() {
                 log("GECKO", if (ready) "DoH ready, loading" else "DoH not ready after 10s, loading anyway")
                 runOnUiThread { loadUrl() }
             }.apply { name = "waitdoh"; isDaemon = true; start() }
+            }
         } catch (e: Throwable) {
             log("GECKO", "FAILED: $e")
             runOnUiThread { status.text = "❌ GeckoView 失败: ${e.message}" }
@@ -440,12 +488,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        // 官方标准：保存会话状态（当前页+历史），切后台回收后 restoreState
+        if (sessionState != null) {
+            outState.putParcelable("session_state", sessionState)
+        }
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
-        log("APP", "onDestroy")
+        log("APP", "onDestroy finishing=${isFinishing}")
+        // 2026-08-16：切后台/回收导致的 Activity 销毁不能杀 DoH ——
+        // 进程还在，runtime 单例 + DoH 常驻，重建秒恢复且登录不丢
+        // （cookie 在 runtime profile，不在 session）。session 是
+        // Activity 级，总是 close 防泄漏。只有用户真正退出才停 DoH。
         try {
             session.close()
-            com.anglesgirl.echbrowser.echdoh.Echdoh.stop()
         } catch (_: Throwable) {}
+        if (isFinishing) {
+            try {
+                com.anglesgirl.echbrowser.echdoh.Echdoh.stop()
+            } catch (_: Throwable) {}
+        }
         super.onDestroy()
     }
 }
