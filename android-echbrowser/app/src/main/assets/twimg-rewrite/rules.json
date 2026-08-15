@@ -9,7 +9,7 @@
       }
     },
     "condition": {
-      "regexFilter": "^https://(abs-[0-9]|abs-o-ft|abs-o)\\.twimg\\.com/(.*)$",
+      "regexFilter": "^https://(?:abs-[0-9]|abs-o-ft|abs-o)\\.twimg\\.com/(.*)$",
       "resourceTypes": [
         "main_frame",
         "sub_frame",
