@@ -286,7 +286,7 @@ class MainActivity : AppCompatActivity() {
                 { ext: WebExtension? ->
                     log("EXT", "twimg-rewrite installed: ${ext?.id}")
                 },
-                { e: Throwable ->
+                { e: Throwable? ->
                     log("EXT", "twimg-rewrite install failed: $e")
                 }
             )
