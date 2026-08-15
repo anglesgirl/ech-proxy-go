@@ -406,26 +406,51 @@ func isForceCF(name string) bool {
 	return false
 }
 
-// officialSubnetIPs 从官方解析 CF IP 生成候选：官方 IP 优先（最多 3 个），
-// 再从第一个官方 IP 的 /24 段随机采样补足到 max 个。
-// 2026-08-15 用户观点落地：CF 任播下官方 IP 所在 C 段内其他 IP 信誉与
-// 官方同级（风控不区分），可以随便换；而改写为 DoH 端点 IP（Gateway 段
-// 162.159.36.x）会让 CF 看到"目标域流量来自非官方段"→ 信誉机制 403
-// （x.com 失败根因嫌疑，与 CO3 优选 IP 403 同源）。
+// tcpReachable TCP 443 可达性测试（connect 耗时 ≈ RTT，1s 超时）。
+// 2026-08-15 echbrowser 实测：x.com 官方段 172.66.0.x 在移动宽带 TCP
+// 层就超时（code=37）——不改写为可达 IP 时 Firefox 依次试 6 个全超时。
+func tcpReachable(ip string, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "443"), timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// officialSubnetIPs 从官方解析 CF IP 生成候选，全部经过 TCP 443 可达性
+// 过滤：官方 IP 优先（测可达），再从官方 IP 的 /24 段随机采样补足。
+// 官方段整体不可达（如 x.com 172.66.0.x）时返回空 → 调用方回退 DoH
+// 端点/扫描池 IP。
 func officialSubnetIPs(official []string, max int) []string {
 	var out []string
 	seen := map[string]bool{}
-	for _, ip := range official {
+	add := func(ip string) bool {
 		if seen[ip] {
-			continue
+			return false
 		}
 		seen[ip] = true
 		out = append(out, ip)
-		if len(out) >= max {
-			return out
+		return len(out) >= max
+	}
+	// 1. 官方 IP 本身（测可达才用）；记录第一个可达的用于同段采样
+	var reachableOfficial string
+	for _, ip := range official {
+		if tcpReachable(ip, 1500*time.Millisecond) {
+			if reachableOfficial == "" {
+				reachableOfficial = ip
+			}
+			if add(ip) {
+				return out
+			}
 		}
 	}
-	v4 := net.ParseIP(official[0]).To4()
+	// 2. 第一个可达官方 IP 的 /24 段随机采样（同样测可达）；
+	//    官方段整体不可达（x.com 172.66.0.x 移动宽带超时）时返回空。
+	if reachableOfficial == "" {
+		return out
+	}
+	v4 := net.ParseIP(reachableOfficial).To4()
 	if v4 == nil {
 		return out
 	}
@@ -436,14 +461,15 @@ func officialSubnetIPs(official []string, max int) []string {
 	}
 	rng.Shuffle(len(cand), func(i, j int) { cand[i], cand[j] = cand[j], cand[i] })
 	for _, i := range cand {
+		if len(out) >= max {
+			break
+		}
 		ip := net.IPv4(v4[0], v4[1], v4[2], byte(i)).String()
 		if seen[ip] {
 			continue
 		}
-		seen[ip] = true
-		out = append(out, ip)
-		if len(out) >= max {
-			break
+		if tcpReachable(ip, 1500*time.Millisecond) {
+			add(ip)
 		}
 	}
 	return out
