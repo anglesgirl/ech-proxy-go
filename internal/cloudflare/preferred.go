@@ -204,6 +204,12 @@ func ScanPreferredIPs(n int, budget time.Duration) []string {
 		return nil
 	}
 	// 3. 测速（用剩余时间，但每 IP 超时固定）
+	// 候选数限制：预算 8s / 单 IP 最多 3s / 16 并发 ≈ 最多 ~40 个能测完。
+	// baipiao 列表可能几百个，全测会远超预算（2026-08-15 实测 256 个
+	// 随机采样跑满 48s）。取前 40 个足够挑出快的。
+	if len(ips) > 40 {
+		ips = ips[:40]
+	}
 	remain := deadline.Sub(time.Now())
 	if remain <= 0 {
 		return nil
