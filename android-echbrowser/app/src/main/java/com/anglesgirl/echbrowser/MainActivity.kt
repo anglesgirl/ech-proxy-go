@@ -282,6 +282,20 @@ class MainActivity : AppCompatActivity() {
             log("GECKO", "runtime ready (created=${runtime != null})")
 
             session = GeckoSession()
+            // 2026-08-16：popup 弹窗默认放行（无用户手势的弹窗被拦截 →
+            // 按钮点了没反应）。配合 onLoadRequest 的 TARGET_WINDOW_NEW
+            // 处理，OAuth 登录流程完整可用。
+            session.promptDelegate = object : GeckoSession.PromptDelegate {
+                override fun onPopupPrompt(
+                    s: GeckoSession,
+                    prompt: GeckoSession.PromptDelegate.PopupPrompt
+                ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                    log("NAV", "popup prompt allow: ${prompt.targetUri}")
+                    return GeckoResult.fromValue(
+                        prompt.confirm(GeckoSession.NavigationDelegate.AllowOrDeny.ALLOW)
+                    )
+                }
+            }
             // 官方标准：PermissionDelegate（消掉 ContentPermission 报错，
             // 页面权限请求默认放行 —— x.com 的 clipboard/notification 等）
             session.permissionDelegate = object : GeckoSession.PermissionDelegate {
@@ -313,6 +327,25 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+                override fun onLoadRequest(
+                    s: GeckoSession,
+                    request: GeckoSession.NavigationDelegate.LoadRequest
+                ): GeckoResult<GeckoSession.NavigationDelegate.AllowOrDeny> {
+                    // 2026-08-16：OAuth 弹窗（谷歌/苹果登录 target=_blank）
+                    // 默认不处理 = 按钮点了没反应。改：新窗口请求直接在当前
+                    // session 加载（走完流程重定向回原页面）
+                    if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
+                        log("NAV", "popup window: ${request.uri} -> load in current session")
+                        s.load(request.uri)
+                        return GeckoResult.fromValue(
+                            GeckoSession.NavigationDelegate.AllowOrDeny.DENY
+                        )
+                    }
+                    return GeckoResult.fromValue(
+                        GeckoSession.NavigationDelegate.AllowOrDeny.ALLOW
+                    )
+                }
+
                 override fun onLocationChange(
                     session: GeckoSession,
                     url: String?,
