@@ -261,11 +261,30 @@ class MainActivity : AppCompatActivity() {
             session.open(runtime!!)
             geckoView.setSession(session)
             log("GECKO", "session open, loading")
+            installTwimgRewrite()
             loadUrl()
         } catch (e: Throwable) {
             log("GECKO", "FAILED: $e")
             runOnUiThread { status.text = "❌ GeckoView 失败: ${e.message}" }
         }
+    }
+
+    /** 内置扩展：把 CF 上没有配置的 twimg 子域（abs-0 等）重写到
+     *  abs.twimg.com。请求发出前在扩展层改 host，零 SNI 泄漏、零额外
+     *  往返。2026-08-15：abs-0 在 CF 无配置（明文 SNI 打 CF 边缘握手
+     *  失败、Host=abs-0 返回 403），只能 fail-closed 或改写。内容实测
+     *  等价：同路径 624557 字节仅差 40 字节 Sentry release id。
+     *  失败不影响主流程 —— 只是资源缺失，不该让浏览器起不来。 */
+    private fun installTwimgRewrite() {
+        val rt = runtime ?: return
+        rt.webExtensionController.installBuiltIn("resource://android/assets/twimg-rewrite/")
+            .accept { ext ->
+                log("EXT", "twimg-rewrite installed: ${ext.id}")
+            }
+            .exceptionally { e ->
+                log("EXT", "twimg-rewrite install failed: $e")
+                null
+            }
     }
 
     /** 手动 IP 覆盖对话框（2026-08-15 用户要求）：输"域名=IP"每行一条，

@@ -678,7 +678,11 @@ func forcedHintIPs(name string, official []string, max int) []string {
 
 	for {
 		forcedHintMu.Lock()
-		if e, ok := forcedHintCache[key]; ok && time.Since(e.ts) < forcedHintTTL && len(e.ips) > 0 {
+		if e, ok := forcedHintCache[key]; ok && time.Since(e.ts) < forcedHintTTL {
+			// 命中即返回，包括负缓存（ips 为 nil 的 fail-closed 结果）。
+			// 2026-08-15：旧代码 len(e.ips)>0 才算命中，abs-0 探测全失败
+			// 返回 nil 后不写缓存，导致每次 DNS 查询都重探 16 个 IP
+			// （日志 21:07:41→56 重探十几次）。
 			forcedHintMu.Unlock()
 			return e.ips
 		}
@@ -740,6 +744,11 @@ func forcedHintIPs(name string, official []string, max int) []string {
 	if len(out) == 0 {
 		slog("%s: ECH probe failed on all candidates (official=%v) "+
 			"-> CF 无此域名配置，返回空 A（fail-closed，不暴露 SNI）", name, official)
+		// 负结果也写缓存：否则每次查询都重探（abs-0 实测日志里 16 个 IP
+		// 反复探测十几次）。域名在 CF 的配置不会频繁变化，5min 足够。
+		forcedHintMu.Lock()
+		forcedHintCache[key] = forcedHintEntry{ips: nil, ts: time.Now()}
+		forcedHintMu.Unlock()
 		return nil
 	}
 

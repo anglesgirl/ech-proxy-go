@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "name": "twimg-rewrite",
+  "version": "1.0",
+  "description": "把 CF 上不存在的 twimg 子域（abs-0 等）重写到 abs.twimg.com —— 内容实测等价（62 万字节仅差 40 字节 Sentry release id），避免明文 SNI 泄漏。",
+
+  "applications": {
+    "gecko": {
+      "id": "twimg-rewrite@anglesgirl.local"
+    }
+  },
+
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "*://*.twimg.com/*"
+  ],
+
+  "background": {
+    "scripts": ["background.js"]
+  }
+}
