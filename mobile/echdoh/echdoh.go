@@ -572,12 +572,15 @@ func LoadEchTestCache(path string) {
 	loaded := 0
 	for k, v := range m {
 		ts := time.Unix(v.TS, 0)
-		ttl := 10 * time.Minute
+		ttl := time.Hour
 		if v.OK {
-			ttl = poolTrueTTL // 钦定 pool IP 长缓存
+			// true 统一 24h（2026-08-15：不只 pool IP，所有 ECH 探测
+			// 通过的 IP 都落盘 —— 冷启动 x.com 全家桶免全量重探）
+			ttl = poolTrueTTL
 		} else {
-			ttl = time.Hour // false 也落盘缓存 1h（2026-08-15：abs-0 全 false
-			// 结果不落盘 → 冷启动每次重探 8 IP 浪费 12 秒才跳转）
+			// false 也落盘缓存 1h（abs-0 全 false 结果不落盘 →
+			// 冷启动每次重探 8 IP 浪费 12 秒才跳转）
+			ttl = time.Hour
 		}
 		if now.Sub(ts) > ttl {
 			continue

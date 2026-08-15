@@ -293,7 +293,23 @@ class MainActivity : AppCompatActivity() {
             geckoView.setSession(session)
             log("GECKO", "session open, loading")
             installTwimgRewrite()
-            loadUrl()
+            // 等 DoH 就绪再加载（2026-08-15：竞态 —— DoH 未启动完 Firefox
+            // 就查 TRR，trr.mode=3 无回退 → 每次冷启动开头 code=37 失败）
+            Thread {
+                var ready = false
+                for (i in 0..19) {
+                    try {
+                        val s = java.net.Socket("127.0.0.1", DOH_PORT.toInt())
+                        s.close()
+                        ready = true
+                        break
+                    } catch (_: Throwable) {
+                    }
+                    Thread.sleep(500)
+                }
+                log("GECKO", if (ready) "DoH ready, loading" else "DoH not ready after 10s, loading anyway")
+                runOnUiThread { loadUrl() }
+            }.apply { name = "waitdoh"; isDaemon = true; start() }
         } catch (e: Throwable) {
             log("GECKO", "FAILED: $e")
             runOnUiThread { status.text = "❌ GeckoView 失败: ${e.message}" }

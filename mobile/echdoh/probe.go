@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/anglesgirl/ech-proxy-go/internal/dns"
 	"github.com/anglesgirl/ech-proxy-go/internal/tlsconn"
+	mdns "github.com/miekg/dns"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -107,6 +109,9 @@ func shouldForceCF(name string) bool {
 
 // probeDomain 后台探测：连 CF 边缘 + ECH，TLS 证书验证。
 // 成功（CF 有证书）= 可强改；失败 = 不可强改。结果写缓存并持久化。
+// 2026-08-15 优化：先查 A 记录是否 CF（AS13335）—— 非 CF 域名
+// （mozilla/Google/Apple 等）直接标记 NOT-forceable，不做 ECH 握手。
+// 冷启动日志里 firefox.settings/accounts.google 等探测纯浪费 20s。
 func probeDomain(name string) {
 	defer func() {
 		probeMu.Lock()
@@ -114,6 +119,27 @@ func probeDomain(name string) {
 		probeMu.Unlock()
 	}()
 	slog("probe: testing %s against CF edge...", name)
+
+	// 快速判定：A 记录全部非 CF → 直接 NOT-forceable（不做 ECH 握手）
+	q := new(mdns.Msg)
+	q.SetQuestion(mdns.Fqdn(name), mdns.TypeA)
+	r, err := queryUpstream(q)
+	if err == nil && r != nil {
+		var ips []string
+		for _, rr := range r.Answer {
+			if a, ok := rr.(*mdns.A); ok {
+				ips = append(ips, a.A.String())
+			}
+		}
+		if len(ips) > 0 && !cloudflare.AllAS13335(ips) {
+			slog("probe: %s A=%v not CF (cname=), keep original -> NOT-forceable (fast)", name, ips)
+			probeMu.Lock()
+			probeCache[name] = false
+			saveProbeCacheLocked()
+			probeMu.Unlock()
+			return
+		}
+	}
 
 	d := tlsconn.New(8*time.Second, false, false)
 	hintIPs := fetchDohEndpointIPv4s()
