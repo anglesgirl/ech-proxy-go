@@ -257,7 +257,7 @@ class MainActivity : AppCompatActivity() {
 
                 override fun onAndroidPermissionsRequest(
                     s: GeckoSession,
-                    permissions: Array<out String>,
+                    permissions: Array<out String>?,
                     callback: GeckoSession.PermissionDelegate.Callback
                 ) {
                     callback.grant()
@@ -266,11 +266,11 @@ class MainActivity : AppCompatActivity() {
                 override fun onMediaPermissionRequest(
                     s: GeckoSession,
                     uri: String,
-                    video: List<GeckoSession.PermissionDelegate.MediaSource>?,
-                    audio: List<GeckoSession.PermissionDelegate.MediaSource>?,
+                    video: Array<GeckoSession.PermissionDelegate.MediaSource>?,
+                    audio: Array<GeckoSession.PermissionDelegate.MediaSource>?,
                     callback: GeckoSession.PermissionDelegate.MediaCallback
                 ) {
-                    callback.grant(video?.firstOrNull(), audio?.firstOrNull())
+                    callback.grant(video?.getOrNull(0), audio?.getOrNull(0))
                 }
             }
             session.navigationDelegate = object : GeckoSession.NavigationDelegate {
