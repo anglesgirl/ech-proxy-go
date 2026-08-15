@@ -318,20 +318,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 内置扩展：MV3 declarativeNetRequest 静态规则，把 CF 上没有配置的
-     *  twimg 子域（abs-0 等）重写到 abs.twimg.com。
-     *  2026-08-15：MV2 webRequest 版装了但 background 不跑（GeckoView
-     *  对 MV2 background 支持缺失），换 MV3 dNR —— 静态规则声明式生效，
-     *  无需 background 脚本。扩展失败不影响主流程。 */
+    /** 内置扩展：MV3 + webRequestBlocking 请求改写（GeckoView 支持）。
+     *  2026-08-16 实测定论：MV2 webRequest background 不跑、MV3 dNR
+     *  只拦导航（子资源 css/js/img 拦不住）。MV3 background scripts +
+     *  webRequestBlocking + redirectUrl 才是子资源可用的正解 ——
+     *  URL-Modifier-by-Gerbil（火狐 140+ 内核）验证过的模式。
+     *  规则内置 abs-0→abs（改 TXT rewrite= 由 App 注入）。
+     *  扩展失败不影响主流程。 */
     private fun installTwimgRewrite() {
         val rt = runtime ?: return
-        rt.webExtensionController.installBuiltIn("resource://android/assets/twimg-rewrite/")
+        rt.webExtensionController.installBuiltIn("resource://android/assets/url-modifier/")
             .accept(
                 { ext: WebExtension? ->
-                    log("EXT", "twimg-rewrite installed: ${ext?.id}")
+                    log("EXT", "url-modifier installed: ${ext?.id}")
                 },
                 { e: Throwable? ->
-                    log("EXT", "twimg-rewrite install failed: $e")
+                    log("EXT", "url-modifier install failed: $e")
                 }
             )
     }

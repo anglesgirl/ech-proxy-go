@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "url-modifier",
+  "version": "1.0.4",
+  "description": "MV3 + webRequestBlocking 请求 URL 改写（GeckoView 支持）：正则替换规则，子资源 css/js/img 全部生效。2026-08-16 启用：dNR 在 GeckoView 只拦导航，MV3 background + webRequest blocking 才是子资源可用的正解。",
+
+  "permissions": [
+    "storage",
+    "webRequest",
+    "webRequestBlocking",
+    "webNavigation",
+    "tabs"
+  ],
+
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "scripts": [
+      "src/background/background.js"
+    ]
+  },
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "url-modifier@anglesgirl.local"
+    }
+  }
+}
