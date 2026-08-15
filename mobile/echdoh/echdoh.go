@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -533,14 +534,81 @@ func tcpReachable(ip string, timeout time.Duration) bool {
 // echHandshakeCache ECH 握手测试结果缓存（域名+IP → 是否 ECH accepted）。
 // false 结果只缓存 60s（2026-08-15 实测同一 IP 探测结果不稳定：网络抖动
 // 时一次 false 会害死整段），true 缓存 10min。
+// 2026-08-15 用户钦定 pool IP（TXT cloud config pool=）：true 结果缓存
+// 24h 并落盘（echtest-cache.json），下次启动直接读缓存零探测 —— 除非
+// 过期或用户改 pool 才重探。
 var (
 	echTestMu    sync.Mutex
 	echTestCache = map[string]echTestEntry{}
+	echTestPath  string
 )
 
 type echTestEntry struct {
 	ok bool
 	ts time.Time
+}
+
+// poolTrueTTL 钦定 pool IP 的 true 缓存时长（24h）。
+const poolTrueTTL = 24 * time.Hour
+
+// LoadEchTestCache 从文件加载 IP 级 ECH 探测缓存（App 启动时调用）。
+// 过期条目丢弃。与域名级 probe-cache.json 分离（echtest-cache.json）。
+func LoadEchTestCache(path string) {
+	echTestMu.Lock()
+	defer echTestMu.Unlock()
+	echTestPath = path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var m map[string]struct {
+		OK bool  `json:"ok"`
+		TS int64 `json:"ts"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	now := time.Now()
+	loaded := 0
+	for k, v := range m {
+		ts := time.Unix(v.TS, 0)
+		ttl := 10 * time.Minute
+		if v.OK {
+			ttl = poolTrueTTL // 钦定 pool IP 长缓存
+		}
+		if now.Sub(ts) > ttl {
+			continue
+		}
+		echTestCache[k] = echTestEntry{ok: v.OK, ts: ts}
+		loaded++
+	}
+	slog("ech test cache loaded: %d entries from %s", loaded, path)
+}
+
+// SaveEchTestCache 持久化 IP 级 ECH 探测缓存。
+func SaveEchTestCache() {
+	echTestMu.Lock()
+	defer echTestMu.Unlock()
+	if echTestPath == "" {
+		return
+	}
+	m := map[string]struct {
+		OK bool  `json:"ok"`
+		TS int64 `json:"ts"`
+	}{}
+	for k, v := range echTestCache {
+		m[k] = struct {
+			OK bool  `json:"ok"`
+			TS int64 `json:"ts"`
+		}{v.ok, v.ts.Unix()}
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(echTestPath, data, 0644); err != nil {
+		slog("ech test cache save failed: %v", err)
+	}
 }
 
 // echHandshakeOK 对候选 IP 做完整 ECH 握手测试（TCP + ClientHello 带 CF
@@ -683,6 +751,17 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 	return out
 }
 
+// containsStr 判断列表是否含某字符串（cloudconfig.go 也有一个，
+// 这里复用同包定义 —— 若重复定义编译会报，保持单定义）。
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 // ── 强制改写候选 IP：A 记录与 HTTPS ipv4hint 共用同一批 ──────────────
 //
 // 2026-08-15 根因：forceRewriteA 在 ECH 探测全失败时回退「原始官方 IP」
@@ -751,19 +830,69 @@ func forcedHintIPs(name string, official []string, max int) []string {
 
 	var out []string
 	src := ""
+
+	// 0. 云配置 pool IP（用户钦定，2026-08-15）：先查 IP 级缓存 ——
+	// true 缓存 24h（用户钦定信任度高），命中直接用不重探；无缓存才
+	// 探测一次并落盘。日志不再出现 pool IP 的重复探测行。
+	// ECH 可用性域名相关（api.x.com 上 pool IP 曾 false），所以仍要
+	// 按当前域名查缓存/探测，不能无条件信任。
+	for _, ip := range cloudPoolIPs() {
+		echTestMu.Lock()
+		e, cached := echTestCache[name+"|"+ip]
+		echTestMu.Unlock()
+		if cached {
+			if e.ok && time.Since(e.ts) < poolTrueTTL && !containsStr(out, ip) {
+				out = append(out, ip)
+			}
+			continue // 缓存命中（无论 ok 与否）不重探
+		}
+		// 无缓存：探测一次，结果落盘（后续 24h 免探）
+		if echHandshakeOK(ip, name, 3*time.Second) && !containsStr(out, ip) {
+			out = append(out, ip)
+		}
+	}
+	if len(out) > 0 {
+		SaveEchTestCache()
+		src = "cloud-pool(ECH-cached)"
+		if len(out) >= max {
+			slog("%s: forced hint IPs <- %s %v", name, src, out[:max])
+			forcedHintMu.Lock()
+			forcedHintCache[key] = forcedHintEntry{ips: out[:max], ts: time.Now()}
+			forcedHintMu.Unlock()
+			return out[:max]
+		}
+	}
+
 	if len(official) > 0 {
 		if ips := officialSubnetIPs(official, name, max); len(ips) > 0 {
-			out, src = ips, "official-subnet(ECH-probed)"
+			// pool IP 保留在前，official 结果补足（不覆盖 out）
+			src = "official-subnet(ECH-probed)"
+			for _, ip := range ips {
+				if !containsStr(out, ip) {
+					out = append(out, ip)
+				}
+				if len(out) >= max {
+					break
+				}
+			}
 		}
 	}
 	// 官方段 ECH 全挂 → 可达池里挑 ECH 握手成功的（xprobe 实测 162.159.36.x
 	// 这类 CF 边缘 inner-SNI=x.com 的 ECH 握手成功 → HTTP 200）
 	pool := fetchDohEndpointIPv4s()
-	if len(out) == 0 && len(pool) > 0 {
+	if len(out) < max && len(pool) > 0 {
 		// 探测 8 个（2026-08-15 优化：原 16 个，手机日志实测探测太多
 		// 浪费 —— 8 个足够，池子 IP 冗余度高）
 		if ips := echFilterPool(pool, name, max, 8); len(ips) > 0 {
-			out, src = ips, "reachable-pool(ECH-probed)"
+			src = "reachable-pool(ECH-probed)"
+			for _, ip := range ips {
+				if !containsStr(out, ip) {
+					out = append(out, ip)
+				}
+				if len(out) >= max {
+					break
+				}
+			}
 		}
 	}
 	// ⚠️ 没有第三级「可达池原样」兜底 —— fail-closed。

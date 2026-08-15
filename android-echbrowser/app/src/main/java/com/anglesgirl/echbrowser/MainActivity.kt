@@ -150,6 +150,12 @@ class MainActivity : AppCompatActivity() {
                         File(filesDir, "probe-cache.json").absolutePath
                     )
                 } catch (_: Throwable) {}
+                // 加载 IP 级 ECH 探测缓存（钦定 pool IP 24h 免重探）
+                try {
+                    com.anglesgirl.echbrowser.echdoh.Echdoh.loadEchTestCache(
+                        File(filesDir, "echtest-cache.json").absolutePath
+                    )
+                } catch (_: Throwable) {}
                 val cert = assets.open("doh-fullchain.pem").bufferedReader().readText()
                 val key = assets.open("doh-key.pem").bufferedReader().readText()
                 log("DOH", "cert ${cert.length}B key ${key.length}B")
