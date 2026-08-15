@@ -53,7 +53,27 @@ class MainActivity : AppCompatActivity() {
         log("APP", "UI built")
         startEchDoh()
         startGoLogPoller()
+        startConsoleCapture()
         startGecko()
+    }
+
+    /** 捕获 Gecko 页面 console（网页 JS 的 console 输出）→ echbrowser.log。
+     *  GeckoView 没有 console 回调 API（onConsoleMessage 不存在），只能
+     *  consoleOutput(true) 打到 logcat（tag GeckoConsole）。debug APK 有
+     *  权限读自己的 logcat，起线程持续抓 GeckoConsole 写进日志文件，
+     *  排查 x.com 前端脚本/资源加载失败直接看 [PAGE-CONSOLE] 行。
+     *  2026-08-15 用户要求「页面日志也开出来」。 */
+    private fun startConsoleCapture() {
+        Thread {
+            try {
+                val p = ProcessBuilder("logcat", "-v", "time", "GeckoConsole:V", "*:S")
+                    .redirectErrorStream(true).start()
+                p.inputStream.bufferedReader().forEachLine { line ->
+                    if (line.isNotBlank()) log("PAGE-CONSOLE", line)
+                }
+            } catch (_: Throwable) {
+            }
+        }.apply { name = "consolecap"; isDaemon = true; start() }
     }
 
     /** 轮询 Go 侧 DoH 日志（注入/改写过程），写入 echbrowser.log。 */
@@ -215,28 +235,15 @@ class MainActivity : AppCompatActivity() {
 
             val settings = GeckoRuntimeSettings.Builder()
                 .configFilePath(configFile.absolutePath)
+                // 页面 console 输出到 logcat（GeckoConsole tag），
+                // 由 startConsoleCapture 抓进 echbrowser.log
+                .consoleOutput(true)
                 .build()
             log("GECKO", "creating runtime...")
             runtime = GeckoRuntime.create(this, settings)
             log("GECKO", "runtime created")
 
             session = GeckoSession()
-            // 页面 console 日志（网页 JS 的 console.error/warn）→ echbrowser.log，
-            // 排查 x.com 前端资源加载失败/脚本报错最直接（2026-08-15 用户要求
-            // 「页面日志也开出来」）。只记 warn/error 防刷屏。
-            session.contentDelegate = object : GeckoSession.ContentDelegate {
-                override fun onConsoleMessage(
-                    s: GeckoSession,
-                    message: GeckoSession.ContentDelegate.ConsoleMessage
-                ) {
-                    val lvl = message.logLevel()
-                    if (lvl == GeckoSession.ContentDelegate.ConsoleMessage.Level.ERROR ||
-                        lvl == GeckoSession.ContentDelegate.ConsoleMessage.Level.WARN
-                    ) {
-                        log("PAGE-CONSOLE", "[$lvl] ${message.message()}")
-                    }
-                }
-            }
             session.navigationDelegate = object : GeckoSession.NavigationDelegate {
                 override fun onLocationChange(
                     session: GeckoSession,
