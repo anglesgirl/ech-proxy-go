@@ -831,41 +831,35 @@ func forcedHintIPs(name string, official []string, max int) []string {
 	var out []string
 	src := ""
 
-	// 0. 云配置 pool IP（用户钦定，2026-08-15）：先查 IP 级缓存 ——
-	// true 缓存 24h（用户钦定信任度高），命中直接用不重探；无缓存才
-	// 探测一次并落盘。日志不再出现 pool IP 的重复探测行。
-	// ECH 可用性域名相关（api.x.com 上 pool IP 曾 false），所以仍要
-	// 按当前域名查缓存/探测，不能无条件信任。
+	// 0. 云配置 pool IP（用户钦定）：探测结果缓存 24h 免重探，但**只作为
+	// 备胎放列表末尾** —— 2026-08-15 实测：172.64.146.66（wto.org 段）
+	// 对 x.com Go 探测 ECH true，但 Firefox 实际连接 0x93 NETWORK 失败
+	// （22:45 该 IP 排第 3 时成功，23:16 排第 1 时失败）。探测 true ≠
+	// Firefox 可用，必须让已验证的官方段 IP 排前面。
+	var poolOut []string
 	for _, ip := range cloudPoolIPs() {
 		echTestMu.Lock()
 		e, cached := echTestCache[name+"|"+ip]
 		echTestMu.Unlock()
 		if cached {
-			if e.ok && time.Since(e.ts) < poolTrueTTL && !containsStr(out, ip) {
-				out = append(out, ip)
+			if e.ok && time.Since(e.ts) < poolTrueTTL && !containsStr(poolOut, ip) {
+				poolOut = append(poolOut, ip)
 			}
 			continue // 缓存命中（无论 ok 与否）不重探
 		}
 		// 无缓存：探测一次，结果落盘（后续 24h 免探）
-		if echHandshakeOK(ip, name, 3*time.Second) && !containsStr(out, ip) {
-			out = append(out, ip)
+		if echHandshakeOK(ip, name, 3*time.Second) && !containsStr(poolOut, ip) {
+			poolOut = append(poolOut, ip)
 		}
 	}
-	if len(out) > 0 {
+	if len(poolOut) > 0 {
 		SaveEchTestCache()
 		src = "cloud-pool(ECH-cached)"
-		if len(out) >= max {
-			slog("%s: forced hint IPs <- %s %v", name, src, out[:max])
-			forcedHintMu.Lock()
-			forcedHintCache[key] = forcedHintEntry{ips: out[:max], ts: time.Now()}
-			forcedHintMu.Unlock()
-			return out[:max]
-		}
 	}
 
 	if len(official) > 0 {
 		if ips := officialSubnetIPs(official, name, max); len(ips) > 0 {
-			// pool IP 保留在前，official 结果补足（不覆盖 out）
+			// pool IP 备胎在末尾，official 探测结果优先（2026-08-15）
 			src = "official-subnet(ECH-probed)"
 			for _, ip := range ips {
 				if !containsStr(out, ip) {
@@ -892,6 +886,17 @@ func forcedHintIPs(name string, official []string, max int) []string {
 				if len(out) >= max {
 					break
 				}
+			}
+		}
+	}
+	// 最后补 pool 备胎（不占已验证 IP 的位置）
+	if len(out) < max {
+		for _, ip := range poolOut {
+			if !containsStr(out, ip) {
+				out = append(out, ip)
+			}
+			if len(out) >= max {
+				break
 			}
 		}
 	}
