@@ -20,6 +20,7 @@ import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.WebExtension
 import org.mozilla.geckoview.WebRequestError
 import java.io.File
 
@@ -277,11 +278,13 @@ class MainActivity : AppCompatActivity() {
      *  失败不影响主流程 —— 只是资源缺失，不该让浏览器起不来。 */
     private fun installTwimgRewrite() {
         val rt = runtime ?: return
+        // installBuiltIn 返回 GeckoResult<WebExtension?>：ext 可能为 null，
+        // exceptionally 的 listener 返回类型与 T 一致（WebExtension?）。
         rt.webExtensionController.installBuiltIn("resource://android/assets/twimg-rewrite/")
-            .accept { ext ->
-                log("EXT", "twimg-rewrite installed: ${ext.id}")
+            .accept { ext: WebExtension? ->
+                log("EXT", "twimg-rewrite installed: ${ext?.id}")
             }
-            .exceptionally { e ->
+            .exceptionally { e: Throwable ->
                 log("EXT", "twimg-rewrite install failed: $e")
                 null
             }
