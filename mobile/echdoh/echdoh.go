@@ -626,10 +626,13 @@ func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 	cacheKey := host + "|" + ip
 	echTestMu.Lock()
 	if e, ok := echTestCache[cacheKey]; ok {
-		// true 缓存 10min；false 只缓存 60s（网络抖动时允许重测）
-		ttl := 10 * time.Minute
-		if !e.ok {
-			ttl = 60 * time.Second
+		// 与 LoadEchTestCache 一致的 TTL：true 24h（poolTrueTTL）、
+		// false 1h。2026-08-16 bug：这里原用 true 10min / false 60s，
+		// 落盘加载的条目（24h 收进内存）读取时全被判过期 → 冷启动
+		// 每次都全量重探（00:12 日志 x.com 探测 10 个 IP 12 秒）。
+		ttl := time.Hour
+		if e.ok {
+			ttl = poolTrueTTL
 		}
 		if time.Since(e.ts) < ttl {
 			echTestMu.Unlock()
