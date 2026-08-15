@@ -158,21 +158,18 @@ func Start(listen, doh, cachePath string, noDowngrade bool) error {
 			}
 		}()
 		lastInfo = "listening on " + listen
-		// 2026-08-15 CF IP 优选：启动后后台扫最快边缘 IP（拉白嫖优选列表 +
-		// TLS 握手测速），完成后前置到候选最前。不阻塞启动 —— 首个请求
-		// 用现有候选（远程配置/DoH 端点 IP），扫描完成自动切换最快 IP。
-		// 移动宽带上避免串行试不可达 IP 白等（CO3 实测每次卡 40s+）。
-		go func() {
-			start := time.Now()
-			ips := cloudflare.ScanPreferredIPs(5, 8*time.Second)
-			if len(ips) == 0 {
-				log.Printf("[echproxy] preferred IP scan: no reachable IP (took %v)", time.Since(start))
-				return
-			}
-			s.SetPreferredIPs(ips)
-			log.Printf("[echproxy] preferred IP scan: %d fastest IPs %v (took %v)",
-				len(ips), ips, time.Since(start))
-		}()
+		// 2026-08-15 CF IP 三阶段优选（用户方案，与 CO3 同源）：
+		// 有缓存(12h)立即返回；无缓存 → 采样50不同网段 + TCP延迟排序2s
+		// top10 → speed.cloudflare.com 下载测速8s top3 → 写缓存。
+		// 同步执行：启动即绑定最快 IP 不再乱跳，总耗时 ≤10s。
+		fastStart := time.Now()
+		fastIPs := cloudflare.OptimizeFastIPs(cfg.DNS.CachePath)
+		if len(fastIPs) > 0 {
+			s.SetPreferredIPs(fastIPs)
+			log.Printf("[echproxy] preferred IP scan done in %v: %v", time.Since(fastStart), fastIPs)
+		} else {
+			log.Printf("[echproxy] preferred IP scan: none (took %v)", time.Since(fastStart))
+		}
 		return nil
 	})
 }
