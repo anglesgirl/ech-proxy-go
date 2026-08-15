@@ -37,7 +37,7 @@ var (
 	upstream []string
 	// 手动 IP 覆盖（2026-08-15 用户要求）：域名=IP 强制改写 A 记录，
 	// 不用等构建直接测试任意 IP（如 x.com=162.159.140.229）。
-	overrideMu sync.Mutex
+	overrideMu  sync.Mutex
 	overrideMap = map[string]string{}
 )
 
@@ -498,8 +498,8 @@ var (
 )
 
 type echTestEntry struct {
-	ok  bool
-	ts  time.Time
+	ok bool
+	ts time.Time
 }
 
 // echHandshakeOK 对候选 IP 做完整 ECH 握手测试（TCP + ClientHello 带 CF
@@ -581,7 +581,7 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 		go func(ip string) {
 			// 3s 超时（2026-08-15 修复：xprobe 实测 x.com ECH 握手
 			// 1.519s，原 1.5s 超时卡边，抖动即 false；并发探测总耗时不变）
-			ch <- res{ip, echHandshakeOK(ip, name, 3 * time.Second)}
+			ch <- res{ip, echHandshakeOK(ip, name, 3*time.Second)}
 		}(ip)
 	}
 	var reachable []string
@@ -636,6 +636,161 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 	return out
 }
 
+// ── 强制改写候选 IP：A 记录与 HTTPS ipv4hint 共用同一批 ──────────────
+//
+// 2026-08-15 根因：forceRewriteA 在 ECH 探测全失败时回退「原始官方 IP」
+// （x.com 172.66.0.227 / 162.159.140.229），而那批 IP 正是刚被探测判定
+// ECH 不可用的 —— Firefox 只拿到 1 个 A 记录 → TCP/TLS 超时 → code=37。
+// 同时 HTTPS 记录的 ipv4hint 用 fetchDohEndpointIPv4s()（实测可达池），
+// 与 A 记录不是同一批，两条路径连不同 IP。
+//
+// 修复：统一走 forcedHintIPs()，三级兜底且绝不回退到探测失败的官方 IP：
+//  1. 官方 IP + 其 /24 段中 ECH 握手成功的（officialSubnetIPs）
+//  2. 官方段整体 ECH 不可用 → 从可达池里挑 ECH 握手成功的
+//  3. 全失败 → 可达池原样（宁可给「可达但未验证」，绝不给「已知不可达」）
+var (
+	forcedHintMu     sync.Mutex
+	forcedHintCache  = map[string]forcedHintEntry{}
+	forcedHintFlight = map[string]*sync.WaitGroup{} // 单飞：A/HTTPS 并发查询只探测一次
+)
+
+type forcedHintEntry struct {
+	ips []string
+	ts  time.Time
+}
+
+const forcedHintTTL = 5 * time.Minute
+
+// forcedHintIPs 返回域名强制改写用的 IP 列表（最多 max 个）。
+// official 为该域名官方解析出的 CF IP；传 nil 时（HTTPS 查询场景，
+// 响应里没有 A 记录）内部自己做一次上游 A 查询补齐。
+//
+// 单飞保护：Firefox 会几乎同时发 A / AAAA / HTTPS 三个查询，若各自独立
+// 探测会重复几十次 TLS 握手（旧日志里同一秒重复三遍 ECH probe 即此因）。
+func forcedHintIPs(name string, official []string, max int) []string {
+	key := strings.TrimSuffix(strings.ToLower(dns.Fqdn(name)), ".")
+
+	for {
+		forcedHintMu.Lock()
+		if e, ok := forcedHintCache[key]; ok && time.Since(e.ts) < forcedHintTTL && len(e.ips) > 0 {
+			forcedHintMu.Unlock()
+			return e.ips
+		}
+		if wg, inflight := forcedHintFlight[key]; inflight {
+			forcedHintMu.Unlock()
+			wg.Wait() // 等别人探测完，回头读缓存
+			continue
+		}
+		wg := &sync.WaitGroup{}
+		wg.Add(1)
+		forcedHintFlight[key] = wg
+		forcedHintMu.Unlock()
+		defer func() {
+			forcedHintMu.Lock()
+			delete(forcedHintFlight, key)
+			forcedHintMu.Unlock()
+			wg.Done()
+		}()
+		break
+	}
+
+	if len(official) == 0 {
+		official = lookupOfficialCFIPv4s(name)
+	}
+
+	var out []string
+	src := ""
+	if len(official) > 0 {
+		if ips := officialSubnetIPs(official, name, max); len(ips) > 0 {
+			out, src = ips, "official-subnet(ECH-probed)"
+		}
+	}
+	// 官方段 ECH 全挂 → 可达池里挑 ECH 握手成功的（xprobe 实测 162.159.36.x
+	// 这类 CF 边缘 inner-SNI=x.com 的 ECH 握手成功 → HTTP 200）
+	pool := fetchDohEndpointIPv4s()
+	if len(out) == 0 && len(pool) > 0 {
+		if ips := echFilterPool(pool, name, max, 16); len(ips) > 0 {
+			out, src = ips, "reachable-pool(ECH-probed)"
+		}
+	}
+	// 最后兜底：可达池原样（TCP 层已验证可达，只是 ECH 未探测通过）。
+	// 绝不回退到刚被探测判定 ECH 不可用的官方 IP —— 注意内置池快照里
+	// 本身就含官方 IP（如 162.159.140.229），必须显式剔除已知失败的。
+	if len(out) == 0 && len(pool) > 0 {
+		raw := excludeECHFailed(pool, name, max)
+		if len(raw) > 0 {
+			out, src = raw, "reachable-pool(raw, ECH unprobed)"
+		}
+	}
+	if len(out) == 0 {
+		slog("%s: no forced hint IPs available (official=%v pool empty)", name, official)
+		return nil
+	}
+
+	forcedHintMu.Lock()
+	forcedHintCache[key] = forcedHintEntry{ips: out, ts: time.Now()}
+	forcedHintMu.Unlock()
+	slog("%s: forced hint IPs <- %s %v", name, src, out)
+	return out
+}
+
+// excludeECHFailed 从候选里剔除「探测缓存已记录 ECH 失败」的 IP，
+// 保留未探测过或探测成功的（最多 max 个）。
+func excludeECHFailed(pool []string, host string, max int) []string {
+	echTestMu.Lock()
+	defer echTestMu.Unlock()
+	var out []string
+	for _, ip := range pool {
+		if e, ok := echTestCache[host+"|"+ip]; ok && !e.ok {
+			continue // 已知 ECH 不可用
+		}
+		out = append(out, ip)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// echFilterPool 从候选池并发挑出 ECH 握手成功的 IP（最多 max 个，
+// 最多探测 probeLimit 个候选，避免池子大时启动几十个 goroutine）。
+func echFilterPool(pool []string, name string, max, probeLimit int) []string {
+	cands := pool
+	if len(cands) > probeLimit {
+		cands = cands[:probeLimit]
+	}
+	type res struct {
+		ip string
+		ok bool
+	}
+	ch := make(chan res, len(cands))
+	for _, ip := range cands {
+		go func(ip string) {
+			ch <- res{ip, echHandshakeOK(ip, name, 3*time.Second)}
+		}(ip)
+	}
+	var out []string
+	for range cands {
+		r := <-ch
+		if r.ok && len(out) < max {
+			out = append(out, r.ip)
+		}
+	}
+	return out
+}
+
+// lookupOfficialCFIPv4s 上游查一次 A 记录，提取官方解析的 CF IP。
+// HTTPS 查询时响应里没有 A 记录，需要单独查以便复用同一批候选。
+func lookupOfficialCFIPv4s(name string) []string {
+	q := new(dns.Msg)
+	q.SetQuestion(dns.Fqdn(name), dns.TypeA)
+	resp, err := queryUpstream(q)
+	if err != nil || resp == nil {
+		return nil
+	}
+	return officialCFIPv4s(resp)
+}
+
 // officialCFIPv4s 从响应中提取官方解析的 CF（AS13335）IPv4（未改写前的原始值）。
 func officialCFIPv4s(resp *dns.Msg) []string {
 	var out []string
@@ -652,28 +807,12 @@ func officialCFIPv4s(resp *dns.Msg) []string {
 	return out
 }
 
-// forceRewriteA 无条件把 A 记录改写为官方 CF IP 同 /24 段（不判断 CF；
-// 无官方 CF IP 时回退 DoH 端点 IP）。
+// forceRewriteA 无条件把 A 记录改写为 forcedHintIPs()（ECH 已验证优先，
+// 绝不回退到探测失败的官方 IP —— 见 forcedHintIPs 注释）。
 func forceRewriteA(resp *dns.Msg, name string) {
-	var hintIPs []string
-	if official := officialCFIPv4s(resp); len(official) > 0 {
-		hintIPs = officialSubnetIPs(official, name, 6)
-		if len(hintIPs) == 0 {
-			// 2026-08-15: 探测全失败 → 兜底给原始官方 IP（宁可慢不空手，
-			// Firefox 拿到空 A 列表立即 loadError，后续探测结果也白搭）
-			hintIPs = official
-			if len(hintIPs) > 6 {
-				hintIPs = hintIPs[:6]
-			}
-			slog("%s: ECH probe all failed, fallback raw official %v", name, hintIPs)
-		} else {
-			slog("%s: FORCED A -> official-subnet(ECH-probed) %v", name, hintIPs)
-		}
-	} else {
-		hintIPs = fetchDohEndpointIPv4s()
-		slog("%s: no official CF A, fallback DoH endpoint %v", name, hintIPs)
-	}
+	hintIPs := forcedHintIPs(name, officialCFIPv4s(resp), 6)
 	if len(hintIPs) == 0 {
+		slog("%s: forceRewriteA no candidates, keep original answers", name)
 		return
 	}
 	newAnswers := make([]dns.RR, 0, len(hintIPs))
@@ -721,7 +860,9 @@ func injectECHForced(resp *dns.Msg, name string) {
 		slog("%s: no CF public ECH key available, skip forced inject", name)
 		return
 	}
-	hintIPs := fetchDohEndpointIPv4s()
+	// ipv4hint 与 A 记录用同一批候选（forcedHintIPs），避免两条路径连
+	// 不同 IP：A 记录给 ECH 已验证 IP、hint 给可达池 → Firefox 行为不定。
+	hintIPs := forcedHintIPs(name, nil, 6)
 	svcb := &dns.SVCB{
 		Hdr:      dns.RR_Header{Name: name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 300},
 		Priority: 1,
