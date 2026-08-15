@@ -271,48 +271,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 内置扩展：把 CF 上没有配置的 twimg 子域（abs-0 等）重写到
-     *  abs.twimg.com。请求发出前在扩展层改 host，零 SNI 泄漏、零额外
-     *  往返。2026-08-15：abs-0 在 CF 无配置（明文 SNI 打 CF 边缘握手
-     *  失败、Host=abs-0 返回 403），只能 fail-closed 或改写。内容实测
-     *  等价：同路径 624557 字节仅差 40 字节 Sentry release id。
-     *  失败不影响主流程 —— 只是资源缺失，不该让浏览器起不来。 */
+    /** 内置扩展：MV3 declarativeNetRequest 静态规则，把 CF 上没有配置的
+     *  twimg 子域（abs-0 等）重写到 abs.twimg.com。
+     *  2026-08-15：MV2 webRequest 版装了但 background 不跑（GeckoView
+     *  对 MV2 background 支持缺失），换 MV3 dNR —— 静态规则声明式生效，
+     *  无需 background 脚本。扩展失败不影响主流程。 */
     private fun installTwimgRewrite() {
         val rt = runtime ?: return
-        // GeckoResult.accept(Consumer<T>, Consumer<Throwable>)：两个独立的
-        // Consumer 参数，分别处理成功和失败。不用 exceptionally（它的
-        // listener 要返回 GeckoResult<U>，裸值不匹配）。
-        // MessageDelegate 挂在 WebExtension 实例上（WebExtension.
-        // setMessageDelegate(delegate, nativeApp)），所以要在安装成功的
-        // accept 回调里设置。message 是扩展 sendNativeMessage 的 JS 对象，
-        // GeckoView 侧序列化为 org.json.JSONObject。
-        val controller = rt.webExtensionController
-        controller.installBuiltIn("resource://android/assets/twimg-rewrite/")
+        rt.webExtensionController.installBuiltIn("resource://android/assets/twimg-rewrite/")
             .accept(
                 { ext: WebExtension? ->
                     log("EXT", "twimg-rewrite installed: ${ext?.id}")
-                    if (ext != null) {
-                        // MessageDelegate 是带 default 方法的 Java 接口，
-                        // Kotlin lambda 无法 SAM 转换，必须显式 object。
-                        ext.setMessageDelegate(
-                            object : WebExtension.MessageDelegate {
-                                override fun onMessage(
-                                    nativeApp: String,
-                                    message: Any,
-                                    sender: WebExtension.MessageSender
-                                ): GeckoResult<Any>? {
-                                    if (nativeApp == "twimg-rewrite@anglesgirl.local" &&
-                                        message is org.json.JSONObject
-                                    ) {
-                                        log("EXT", "[twimg-rewrite] ${message.optString("msg")}")
-                                    }
-                                    return null
-                                }
-                            },
-                            "twimg-rewrite@anglesgirl.local"
-                        )
-                        log("EXT", "twimg-rewrite message delegate set")
-                    }
                 },
                 { e: Throwable? ->
                     log("EXT", "twimg-rewrite install failed: $e")

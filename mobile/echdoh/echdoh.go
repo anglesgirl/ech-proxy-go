@@ -647,8 +647,10 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 				cand = append(cand, i)
 			}
 			rng.Shuffle(len(cand), func(i, j int) { cand[i], cand[j] = cand[j], cand[i] })
-			// 采样最多 12 个并发探测
-			limit := 12
+			// 采样最多 6 个并发探测（2026-08-15 优化：原 12 个，手机日志
+			// 实测每个域名探测 16-20 个 IP 太浪费 —— 6 个采样 + 官方 IP
+			// 足够选出可用段，探测数量减半、速度翻倍）
+			limit := 6
 			if limit > len(cand) {
 				limit = len(cand)
 			}
@@ -670,6 +672,10 @@ func officialSubnetIPs(official []string, name string, max int) []string {
 				s := <-sch
 				if s.ok && !seen[s.ip] && len(out) < max {
 					add(s.ip)
+					// 够了就提前返回，不等剩余探测（省时间）
+					if len(out) >= max {
+						return out
+					}
 				}
 			}
 		}
@@ -754,7 +760,9 @@ func forcedHintIPs(name string, official []string, max int) []string {
 	// 这类 CF 边缘 inner-SNI=x.com 的 ECH 握手成功 → HTTP 200）
 	pool := fetchDohEndpointIPv4s()
 	if len(out) == 0 && len(pool) > 0 {
-		if ips := echFilterPool(pool, name, max, 16); len(ips) > 0 {
+		// 探测 8 个（2026-08-15 优化：原 16 个，手机日志实测探测太多
+		// 浪费 —— 8 个足够，池子 IP 冗余度高）
+		if ips := echFilterPool(pool, name, max, 8); len(ips) > 0 {
 			out, src = ips, "reachable-pool(ECH-probed)"
 		}
 	}
