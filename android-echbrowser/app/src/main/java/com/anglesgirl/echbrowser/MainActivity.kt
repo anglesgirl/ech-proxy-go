@@ -16,6 +16,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
+import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
@@ -291,14 +292,22 @@ class MainActivity : AppCompatActivity() {
                 { ext: WebExtension? ->
                     log("EXT", "twimg-rewrite installed: ${ext?.id}")
                     if (ext != null) {
+                        // MessageDelegate 是带 default 方法的 Java 接口，
+                        // Kotlin lambda 无法 SAM 转换，必须显式 object。
                         ext.setMessageDelegate(
-                            { nativeApp: String, message: Any?, _: WebExtension.MessageSender ->
-                                if (nativeApp == "twimg-rewrite@anglesgirl.local" &&
-                                    message is org.json.JSONObject
-                                ) {
-                                    log("EXT", "[twimg-rewrite] ${message.optString("msg")}")
+                            object : WebExtension.MessageDelegate {
+                                override fun onMessage(
+                                    nativeApp: String,
+                                    message: Any,
+                                    sender: WebExtension.MessageSender
+                                ): GeckoResult<Any>? {
+                                    if (nativeApp == "twimg-rewrite@anglesgirl.local" &&
+                                        message is org.json.JSONObject
+                                    ) {
+                                        log("EXT", "[twimg-rewrite] ${message.optString("msg")}")
+                                    }
+                                    return null
                                 }
-                                null
                             },
                             "twimg-rewrite@anglesgirl.local"
                         )
