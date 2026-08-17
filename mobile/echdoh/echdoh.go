@@ -42,6 +42,20 @@ var (
 	overrideMap = map[string]string{}
 )
 
+// ipv6OnlyDomains：视频 CDN 域名强制 IPv6（对齐 Worker 2026-08-17：
+// IPv4 谷歌全段封，只有 IPv6 国内可达 → A 清空，只走 AAAA 透传）
+var ipv6OnlyDomains = []string{"googlevideo.com", "c.youtube.com"}
+
+func isIPV6OnlyDomain(name string) bool {
+	n := strings.ToLower(strings.TrimSuffix(name, "."))
+	for _, d := range ipv6OnlyDomains {
+		if n == d || strings.HasSuffix(n, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
 // SetOverride 设置域名→IP 强制覆盖（逗号/换行分隔多条："x.com=162.159.140.229"）。
 // 支持多 IP："x.com=172.64.146.66,104.18.41.190"（A 记录返回多个，Firefox 挨个试）。
 // 热更新：DNS 查询实时生效，无需重启。
@@ -64,6 +78,60 @@ func SetOverride(s string) {
 		}
 	}
 	slog("override set: %d rule(s)", len(overrideMap))
+}
+
+// ---- override v6（2026-08-16）----
+// override 只改 A（IPv4），AAAA 一律清空 —— 但配了 IPv4 专用 IP 的域名
+// （如 google.com=阿里云专用 IP）仍需要真实 IPv6 双通道（用户：没 IPv6
+// 谷歌就不正常）。TXT 字段：v6_overrides=host=ipv6,ipv6;host=ipv6
+var overrideV6Mu sync.Mutex
+
+var overrideV6Map = map[string][]string{}
+
+// SetOverrideV6 设置 IPv6 override 规则（host=ipv6,ipv6;...）。
+func SetOverrideV6(spec string) {
+	overrideV6Mu.Lock()
+	defer overrideV6Mu.Unlock()
+	overrideV6Map = map[string][]string{}
+	for _, rule := range strings.Split(spec, ";") {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+		parts := strings.SplitN(rule, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(parts[0]), "."))
+		var v6s []string
+		for _, v := range strings.Split(parts[1], ",") {
+			v = strings.TrimSpace(v)
+			if net.ParseIP(v) != nil && strings.Contains(v, ":") {
+				v6s = append(v6s, v)
+			}
+		}
+		if len(v6s) > 0 {
+			overrideV6Map[host] = v6s
+		}
+	}
+	slog("override v6 set: %d rule(s)", len(overrideV6Map))
+}
+
+// matchOverrideV6 返回域名匹配的 IPv6 列表。
+func matchOverrideV6(name string) ([]string, bool) {
+	name = strings.ToLower(strings.TrimSuffix(dns.Fqdn(name), "."))
+	overrideV6Mu.Lock()
+	defer overrideV6Mu.Unlock()
+	if v6s, ok := overrideV6Map[name]; ok {
+		return v6s, true
+	}
+	// 子域匹配（www.google.com → google.com 规则）
+	for host, v6s := range overrideV6Map {
+		if strings.HasSuffix(name, "."+host) {
+			return v6s, true
+		}
+	}
+	return nil, false
 }
 
 // matchOverride 精确或子域匹配（x.com 规则同时覆盖 api.x.com / abs.twimg.com 等）。
@@ -126,10 +194,16 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 		listen = "127.0.0.1:8443"
 	}
 	upstream = nil
-	for _, u := range strings.Split(upstreams, ",") {
-		u = strings.TrimSpace(u)
-		if u != "" {
-			upstream = append(upstream, u)
+	// 2026-08-16：种子 TXT（ech-config.anglesgirl.eu.org doh=/doh2=/doh3=）
+	// 动态上游优先（7 个 CF gateway 轮换，远端可改）；失败用传入的兜底
+	if seed := fetchSeedUpstreams(); len(seed) > 0 {
+		upstream = seed
+	} else {
+		for _, u := range strings.Split(upstreams, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				upstream = append(upstream, u)
+			}
 		}
 	}
 	if len(upstream) == 0 {
@@ -138,16 +212,32 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 			"https://162.159.36.5/dns-query",
 		}
 	}
+	slog("upstreams: %d endpoints", len(upstream))
 
 	// 后台扫描 CF IP 段找可达边缘（进轮换池，解决单一 IP 抖动）
 	StartScanCFIPs(64)
+
+	// 云缓存：启动拉一次云端探测结果合并（SetCloudCache 启用时）
+	go func() {
+		time.Sleep(2 * time.Second) // 等本地缓存加载完
+		cloudPull()
+	}()
 
 	// 云配置：从 doh.anglesgirl.eu.org TXT 拉取 overrides/force/pool
 	// （2026-08-15 用户要求：改 IP 改 DNS 记录即可，零出包）
 	StartCloudConfig()
 
+	// 2026-08-16 预热：后台解析常用域名，填充解析缓存 + 探测缓存
+	// （用户访问时秒回，治"等半天"）。域名 = override 名单 + x.com 全家桶。
+	go warmUpCache()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", handleDoH)
+	// 管理后台（2026-08-16）：本机浏览器打开 https://doh.anglesgirl.eu.org:8443/admin
+	mux.HandleFunc("/admin", handleAdmin)
+	mux.HandleFunc("/admin/api/status", handleAdminStatus)
+	mux.HandleFunc("/admin/api/logs", handleAdminLogs)
+	mux.HandleFunc("/admin/api/refresh", handleAdminRefresh)
 
 	// 用 PEM 内容直接构造 TLS 证书（ListenAndServeTLS 只接受文件路径，
 	// gomobile 场景拿不到文件系统路径，必须 X509KeyPair 加载内容）。
@@ -222,6 +312,7 @@ func LastError() string {
 }
 
 func handleDoH(w http.ResponseWriter, r *http.Request) {
+	queryCount++
 	var raw []byte
 	if r.Method == http.MethodGet {
 		b64 := r.URL.Query().Get("dns")
@@ -259,6 +350,17 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	q := req.Question[0]
 
+	// 2026-08-16 解析结果缓存：命中直接返回（免上游，治"等半天"）。
+	// 只缓存安全类型（A/AAAA/HTTPS），缓存键含 qtype。
+	cacheKey := respCacheKey(q.Name, q.Qtype)
+	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeHTTPS {
+		if cached := respCacheGet(cacheKey); cached != nil {
+			w.Header().Set("Content-Type", "application/dns-message")
+			w.Write(cached)
+			return
+		}
+	}
+
 	resp, err := queryUpstream(req)
 	if err != nil {
 		slog("upstream error for %s %s: %v", q.Name, dns.TypeToString[q.Qtype], err)
@@ -270,10 +372,16 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	// 手动 IP 覆盖（最高优先，2026-08-15）：用户指定的 域名=IP 直接返回。
 	// A 记录返回指定 IP；HTTPS 查询同样注入 ech= + ipv4hint=指定 IP ——
 	// 2026-08-15 实测修复：旧代码只处理 A/AAAA，HTTPS 落到 forced-CF 分支
-	// 注入的 hints 与 A 记录不一致，且用户指定 IP 若不在探测池里 Firefox
-	// 会用明文 SNI 直连 → 被墙（loadError 0x93 NETWORK）。
-	// 手动指定 IP + ECH 才能既用用户想要的 IP 又隐藏 SNI。
-	// AAAA 覆盖域名清空（强制 IPv4）。
+
+	// 2026-08-17：视频域名强制 IPv6（对齐 Worker：googlevideo/c.youtube
+	// IPv4 谷歌全段封，只有 IPv6 国内可达 → A 清空，只走 AAAA 透传）
+	if isIPV6OnlyDomain(q.Name) && q.Qtype == dns.TypeA {
+		resp.Answer = nil
+		slog("%s: IPV6_ONLY A -> empty", q.Name)
+		writeResponse(w, resp, cacheKey)
+		return
+	}
+
 	if ip, ok := matchOverride(q.Name); ok {
 		switch q.Qtype {
 		case dns.TypeA:
@@ -302,15 +410,35 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 				slog("%s: OVERRIDE A -> %v", q.Name, ips)
 			}
 		case dns.TypeAAAA:
-			resp.Answer = nil
-			slog("%s: OVERRIDE AAAA -> empty", q.Name)
+			// 2026-08-16：v6 override 优先（真实 IPv6 双通道，如 google.com）；
+			// 未配 v6 才清空（强制 IPv4）
+			if v6s, ok := matchOverrideV6(q.Name); ok && len(v6s) > 0 {
+				var ans []dns.RR
+				seen := map[string]bool{}
+				for _, s := range v6s {
+					p := net.ParseIP(s)
+					if p == nil || seen[s] {
+						continue
+					}
+					seen[s] = true
+					ans = append(ans, &dns.AAAA{
+						Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+						AAAA: p,
+					})
+				}
+				resp.Answer = ans
+				slog("%s: OVERRIDE AAAA -> %v", q.Name, v6s)
+			} else {
+				resp.Answer = nil
+				slog("%s: OVERRIDE AAAA -> empty", q.Name)
+			}
 		case dns.TypeHTTPS:
 			// 注入 ech= + ipv4hint=override IP 列表：A 与 HTTPS 指向同一批 IP，
 			// Firefox 走 ECH 隐藏 SNI（见 injectECHWithHints）。
 			injectECHWithHints(resp, q.Name, strings.Split(ip, ","))
 			slog("%s: OVERRIDE HTTPS -> ech= + hint=%s", q.Name, ip)
 		}
-		writeResponse(w, resp)
+		writeResponse(w, resp, cacheKey)
 		return
 	}
 
@@ -333,7 +461,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		// trr.mode=3 无 Do53 回退 → loadError code=37。日志里
 		// "x.com A -> 6 answers (forced-CF)" 只是内存里的答案，没发出去。
 		// dohbench 实测：客户端收到 "overflow unpacking uint16"（空响应）。
-		writeResponse(w, resp)
+		writeResponse(w, resp, cacheKey)
 		return
 	}
 
@@ -356,17 +484,21 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	slog("%s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
 		len(resp.Answer), summarizeECH(resp))
 
-	writeResponse(w, resp)
+	writeResponse(w, resp, cacheKey)
 }
 
 // writeResponse 打包并写出 DNS 响应。所有出口必须走这里 —— 2026-08-15
 // 的 code=37 根因就是 forced-CF 分支绕过了写响应的代码直接 return。
-func writeResponse(w http.ResponseWriter, resp *dns.Msg) {
+func writeResponse(w http.ResponseWriter, resp *dns.Msg, cacheKey string) {
 	out, err := resp.Pack()
 	if err != nil {
 		slog("pack failed: %v", err)
 		http.Error(w, "pack failed", http.StatusInternalServerError)
 		return
+	}
+	// 2026-08-16：写解析缓存（A/AAAA/HTTPS 最终响应，含强注强改结果）
+	if cacheKey != "" {
+		respCachePut(cacheKey, out)
 	}
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Header().Set("Cache-Control", "max-age=60")
@@ -397,16 +529,19 @@ func queryUpstream(req *dns.Msg) (*dns.Msg, error) {
 		resp, err := client.Get(full)
 		if err != nil {
 			lastErr = err
+			lastUpstreamErr = fmt.Sprintf("%s %s: %v", time.Now().Format("15:04:05"), u, err)
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
+			lastUpstreamErr = fmt.Sprintf("%s %s: %v", time.Now().Format("15:04:05"), u, err)
 			continue
 		}
 		if resp.StatusCode != 200 {
 			lastErr = fmt.Errorf("upstream HTTP %d", resp.StatusCode)
+			lastUpstreamErr = fmt.Sprintf("%s %s: HTTP %d", time.Now().Format("15:04:05"), u, resp.StatusCode)
 			continue
 		}
 		out := new(dns.Msg)
@@ -622,6 +757,28 @@ func SaveEchTestCache() {
 // 决定性证据：x.com 官方段 162.159.140.x ECH accepted → HTTP 200（1.5s），
 // 而同段 172.66.0.x ECH 握手挂起（echbrowser Firefox code=37 超时）——
 // 官方解析多段中部分段不响应 ECH。必须探测后只改写到 ECH 可用的段。
+// hasOwnECHConfig 查上游 HTTPS 记录：域名是否自带 ech= 配置。
+// 2026-08-16：javchu.com 等发布 CF 公共 ECH 的域名，probe 时 inner cert
+// 是 cloudflare-ech.com（不匹配域名）—— 但 Firefox 用域名自己发布的 ech=
+// 连接，接受该证书，必须算 forceable（否则 A 记录不改写 → 官方 IP 路由到
+// 远边缘，实测 javchu.com → AMS）。
+func hasOwnECHConfig(name string) bool {
+	q := new(dns.Msg)
+	q.SetQuestion(dns.Fqdn(name), dns.TypeHTTPS)
+	resp, err := queryUpstream(q)
+	if err != nil || resp == nil {
+		return false
+	}
+	for _, rr := range resp.Answer {
+		for _, kv := range svcbValues(rr) {
+			if _, isECH := kv.(*dns.SVCBECHConfig); isECH {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 	cacheKey := host + "|" + ip
 	echTestMu.Lock()
@@ -668,9 +825,30 @@ func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 	}()
 	echTestMu.Lock()
 	echTestCache[cacheKey] = echTestEntry{ok: ok, ts: time.Now()}
+	// 2026-08-16：写后即落盘（原只在 pool 分支 Save → 官方段探测结果
+	// 丢了，下次启动重探）。限频：最多 1s 一次，避免高频探测刷盘。
+	entry := echTestCache[cacheKey]
 	echTestMu.Unlock()
+	saveEchTestCacheThrottled()
+	cloudNote(cacheKey, entry) // 云缓存增量（20s 批量推送）
 	slog("%s %s: ECH probe -> %v", host, ip, ok)
 	return ok
+}
+
+// saveEchTestCacheThrottled 限频落盘（1s 内最多一次）。
+var (
+	saveThrottleMu sync.Mutex
+	lastSaveTs     time.Time
+)
+
+func saveEchTestCacheThrottled() {
+	saveThrottleMu.Lock()
+	defer saveThrottleMu.Unlock()
+	if time.Since(lastSaveTs) < time.Second {
+		return
+	}
+	lastSaveTs = time.Now()
+	SaveEchTestCache()
 }
 
 // officialSubnetIPs 从官方解析 CF IP 生成候选，全部经过 ECH 握手探测：
@@ -804,6 +982,15 @@ const forcedHintTTL = 5 * time.Minute
 // 单飞保护：Firefox 会几乎同时发 A / AAAA / HTTPS 三个查询，若各自独立
 // 探测会重复几十次 TLS 握手（旧日志里同一秒重复三遍 ECH probe 即此因）。
 func forcedHintIPs(name string, official []string, max int) []string {
+	return forcedHintIPsOpt(name, official, max, false)
+}
+
+// forcedHintIPsOpt：poolFirst=true 时 pool IP（ECH 验证过的）排最前。
+// 2026-08-16：非 forced 域名（rewriteAIfCF 路径）pool 优先 —— 用户实测
+// javchu.com 官方段 IP 路由到 AMS（欧洲，~200ms），而 pool 钦定 IP
+// （172.64.146.66/104.18.41.190）实测路由 NRT（东京）快；forced 名单
+// （x.com）保持官方段优先（2026-08-15 教训：pool 排第 1 时 0x93 失败）。
+func forcedHintIPsOpt(name string, official []string, max int, poolFirst bool) []string {
 	key := strings.TrimSuffix(strings.ToLower(dns.Fqdn(name)), ".")
 
 	for {
@@ -878,6 +1065,19 @@ func forcedHintIPs(name string, official []string, max int) []string {
 		src = "cloud-pool(ECH-cached)"
 	}
 
+	// poolFirst（非 forced 域名）：pool IP 先入 out（最前），official 补充在后面
+	if poolFirst && len(poolOut) > 0 {
+		for _, ip := range poolOut {
+			if !containsStr(out, ip) {
+				out = append(out, ip)
+			}
+			if len(out) >= max {
+				break
+			}
+		}
+		src = "cloud-pool(ECH-cached,first)"
+	}
+
 	if len(official) > 0 {
 		if ips := officialSubnetIPs(official, name, max); len(ips) > 0 {
 			// pool IP 备胎在末尾，official 探测结果优先（2026-08-15）
@@ -909,6 +1109,19 @@ func forcedHintIPs(name string, official []string, max int) []string {
 				}
 			}
 		}
+	}
+	// 2026-08-16：非 forced 域名 pool 优先（poolFirst）—— 官方段 IP 可能
+	// 路由到远边缘（javchu.com→AMS 实测），pool 钦定 IP 实测路由 NRT 快。
+	if poolFirst && len(poolOut) > 0 {
+		for _, ip := range poolOut {
+			if !containsStr(out, ip) {
+				out = append(out, ip)
+			}
+			if len(out) >= max {
+				break
+			}
+		}
+		src = "cloud-pool(ECH-cached,first)"
 	}
 	// 最后补 pool 备胎（不占已验证 IP 的位置）
 	if len(out) < max {
@@ -1207,7 +1420,7 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 	// forcedHintIPs 同时带来 fail-closed 语义：ECH 探测全失败 → 返回空 →
 	// 这里保持原样不改写（本函数只在 AllAS13335 为真时才走到，域名确实在
 	// CF 上，与 abs-0.twimg.com 那类不同，保留原始解析不会泄漏到墙外 CDN）。
-	hintIPs := forcedHintIPs(name, ips, 6)
+	hintIPs := forcedHintIPsOpt(name, ips, 6, true) // 非 forced：pool 优先（NRT 快）
 	if len(hintIPs) == 0 {
 		slog("%s: ECH probe failed on all candidates, keep original A=%v", name, ips)
 		return
@@ -1323,7 +1536,22 @@ func fetchDohEndpointIPv4s() []string {
 }
 
 // fetchCFPublicECH 获取 Cloudflare 公共 ECH 公钥（cloudflare-ech.com HTTPS ech=）。
+// echKeyMu/echKeyCache: CF 公共 ECH 配置缓存（2026-08-16 优化：
+// 原每次调用都查上游 DoH —— 每个域名探测/响应各拉一次，浪费。
+// cloudflare-ech.com 的配置长期不变，缓存 10min 足够）。
+var (
+	echKeyMu    sync.Mutex
+	echKeyCache []byte
+	echKeyTs    time.Time
+)
+
 func fetchCFPublicECH() []byte {
+	echKeyMu.Lock()
+	if len(echKeyCache) > 0 && time.Since(echKeyTs) < 10*time.Minute {
+		echKeyMu.Unlock()
+		return echKeyCache
+	}
+	echKeyMu.Unlock()
 	q := new(dns.Msg)
 	q.SetQuestion("cloudflare-ech.com.", dns.TypeHTTPS)
 	resp, err := queryUpstream(q)
@@ -1331,14 +1559,21 @@ func fetchCFPublicECH() []byte {
 		slog("fetchCFPublicECH upstream error: %v", err)
 		return nil
 	}
+	var ech []byte
 	for _, rr := range resp.Answer {
 		for _, kv := range svcbValues(rr) {
-			if ech, ok := kv.(*dns.SVCBECHConfig); ok {
-				return ech.ECH
+			if e, ok := kv.(*dns.SVCBECHConfig); ok {
+				ech = e.ECH
 			}
 		}
 	}
-	return nil
+	if len(ech) > 0 {
+		echKeyMu.Lock()
+		echKeyCache = ech
+		echKeyTs = time.Now()
+		echKeyMu.Unlock()
+	}
+	return ech
 }
 
 func summarizeECH(resp *dns.Msg) string {

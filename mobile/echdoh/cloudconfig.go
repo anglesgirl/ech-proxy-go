@@ -14,6 +14,9 @@
 package echdoh
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -23,11 +26,15 @@ import (
 
 // CloudConfig 远程配置（TXT 解析结果）。
 type CloudConfig struct {
-	Overrides map[string]string `json:"overrides"`
-	ForceCF   []string          `json:"force_cf"`
-	Rewrite   map[string]string `json:"rewrite"`
-	Pool      []string          `json:"pool"`
+	Overrides  map[string]string `json:"overrides"`
+	ForceCF    []string          `json:"force_cf"`
+	Rewrite    map[string]string `json:"rewrite"`
+	Pool       []string          `json:"pool"`
+	FallbackIP string            `json:"fallback_ip"` // 2026-08-17：云端 fallbackIp 对齐
 }
+
+// cloudAdminToken：云端 /admin/* 端点鉴权（与 Worker 的 X-Admin-Token 一致）
+const cloudAdminToken = "doh-admin-7f3k9"
 
 var (
 	cloudMu      sync.Mutex
@@ -49,7 +56,11 @@ func StartCloudConfig() {
 	cloudRunning = true
 	cloudMu.Unlock()
 
-	fetchCloudConfigTXT()
+	// 2026-08-17：优先拉云端全量配置（/admin/config-all，与 Worker 对齐）；
+	// 失败回退 TXT 种子
+	if !fetchCloudConfigAll() {
+		fetchCloudConfigTXT()
+	}
 	go func() {
 		for {
 			time.Sleep(cloudTTL)
@@ -65,7 +76,89 @@ func StopCloudConfig() {
 	cloudMu.Unlock()
 }
 
-// fetchCloudConfigTXT 查 doh.anglesgirl.eu.org 的 TXT 记录并应用配置。
+// fetchCloudConfigAll 从云端 Worker 拉全量配置（/admin/config-all），
+// 与应用逻辑完全对齐（rules/overrides/upstreams/fallbackIp）。
+// 2026-08-17：本地端与 Worker 对齐的配置源（替代 TXT 的 overrides/force）。
+func fetchCloudConfigAll() bool {
+	cfgURL := "https://res.anglesgirl.eu.org/admin/config-all"
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", cfgURL, nil)
+	if err != nil {
+		slog("cloud config-all request err: %v", err)
+		return false
+	}
+	req.Header.Set("User-Agent", "echdoh-local/1.0")
+	req.Header.Set("X-Admin-Token", cloudAdminToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		slog("cloud config-all fetch failed: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil || resp.StatusCode != 200 {
+		slog("cloud config-all status %d", resp.StatusCode)
+		return false
+	}
+	var d struct {
+		Rules []struct {
+			Domain string   `json:"domain"`
+			Ips    []string `json:"ips"`
+			Ech    bool     `json:"ech"`
+		} `json:"rules"`
+		Overrides []struct {
+			Name    string   `json:"name"`
+			Domains []string `json:"domains"`
+			Ips     []string `json:"ips"`
+			Ech     bool     `json:"ech"`
+		} `json:"overrides"`
+		Upstreams  []string `json:"upstreams"`
+		FallbackIP string   `json:"fallbackIp"`
+	}
+	if err := json.Unmarshal(body, &d); err != nil {
+		slog("cloud config-all parse err: %v", err)
+		return false
+	}
+
+	// rules + overrides → SetOverride（host=ip,ip;...）
+	var ov []string
+	var force []string
+	for _, r := range d.Rules {
+		if len(r.Ips) > 0 {
+			ov = append(ov, r.Domain+"="+strings.Join(r.Ips, ","))
+		}
+		if r.Ech {
+			force = append(force, r.Domain)
+		}
+	}
+	for _, o := range d.Overrides {
+		for _, dom := range o.Domains {
+			if len(o.Ips) > 0 {
+				ov = append(ov, strings.ToLower(strings.TrimSuffix(dom, "."))+"="+strings.Join(o.Ips, ","))
+			}
+		}
+	}
+	if len(ov) > 0 {
+		SetOverride(strings.Join(ov, ";"))
+	}
+	cloudMu.Lock()
+	if len(force) > 0 {
+		cloudCfg.ForceCF = force
+		cloudCfg.Pool = d.Upstreams // 复用 Pool 字段？不 —— 上游单独设置
+	}
+	if len(d.Upstreams) > 0 {
+		upstream = d.Upstreams
+	}
+	if d.FallbackIP != "" {
+		cloudCfg.FallbackIP = d.FallbackIP
+	}
+	cloudMu.Unlock()
+	slog("cloud config-all applied: %d rules, %d overrides, %d upstreams, fallback=%s",
+		len(d.Rules), len(d.Overrides), len(d.Upstreams), d.FallbackIP)
+	return true
+}
+
+// fetchCloudConfigTXT 查 doh.anglesgirl.eu.org 的 TXT 记录并应用配置（config-all 失败时的兜底）。
 func fetchCloudConfigTXT() {
 	q := new(dns.Msg)
 	q.SetQuestion(dns.Fqdn(cloudDomain), dns.TypeTXT)
@@ -164,6 +257,13 @@ func fetchCloudConfigTXT() {
 		}
 		SetOverride(b.String())
 		slog("cloud config: overrides applied (%d)", len(cfg.Overrides))
+		respCacheClear() // override 变更 → 旧解析缓存失效
+	}
+	// 2026-08-16：v6_overrides=host=ipv6;...（真实 IPv6 双通道）
+	if v := fields["v6_overrides"]; v != "" {
+		SetOverrideV6(v)
+		slog("cloud config: v6 overrides applied")
+		respCacheClear()
 	}
 	slog("cloud config: force=%v pool=%v rewrite=%v", cfg.ForceCF, cfg.Pool, cfg.Rewrite)
 }
