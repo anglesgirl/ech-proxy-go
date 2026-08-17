@@ -191,7 +191,9 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 		return nil
 	}
 	if strings.TrimSpace(listen) == "" {
-		listen = "127.0.0.1:8443"
+		// 2026-08-17：改 0.0.0.0 让浏览器进程也能连（Android 每 app 独立网络命名空间，
+	// 127.0.0.1 只能同进程访问；0.0.0.0 允许同设备不同进程访问 127.0.0.1:8443）
+	listen = "0.0.0.0:8443"
 	}
 	upstream = nil
 	// 2026-08-16：种子 TXT（ech-config.anglesgirl.eu.org doh=/doh2=/doh3=）
