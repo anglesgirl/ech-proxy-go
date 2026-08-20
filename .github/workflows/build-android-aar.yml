@@ -3,6 +3,7 @@ name: Build ech-android AAR
 on:
   push:
     paths:
+      - '.github/workflows/build-android-aar.yml'
       - 'mobile/ech-android/**'
       - 'mobile/echproxy/**'
   workflow_dispatch:
