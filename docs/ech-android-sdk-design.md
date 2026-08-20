@@ -26,27 +26,31 @@ App 侧 4 个 Kotlin 胶水类共 **619 行**，需 hook 进 App 的三层网络
 
 **结论**：胶水不是"散在 41 文件"，而是这 4 个 kt 类要侵入 App 的 OkHttp/WebView/代理三层初始化。对方 App 一升级，这些初始化代码必冲突 → 需手动 rebase 一批。
 
-## 2. 轻量化目标形态
+## 2. 轻量化目标形态（已落地）
 
-把 4 个 kt 胶水类**编译进 aar**（aar 同时含 Go .so + Kotlin 封装层），对外只暴露 3 个入口：
+把解耦后的 Kotlin 封装层独立成 `mobile/ech-android` Android Library Module，
+对外只暴露 3 个入口（详见 `mobile/ech-android/src/main/java/com/anglesgirl/ech/`）：
 
 ```kotlin
-// 1. 应用启动时（替代 HanimeApplication 那行）
-Ech.install(context)
-
-// 2. OkHttp 构建时（装饰器，替代手动加 EchInterceptor + HProxySelector）
-Ech.wrapOkHttp(OkHttp.Builder())
-
-// 3. WebView 初始化时（装饰器，替代自定义 EchWebViewClient）
-Ech.wrapWebView(webView)
+Ech.install(context)                          // Application.onCreate
+Ech.wrapOkHttp(okBuilder)                     // OkHttp.Builder 构建处
+Ech.wrapWebView(webView, delegate)            // WebView 初始化处
 ```
 
-接入方工作量从"改 40+ 文件 / 619 行胶水"降到"改 3-5 行"。
+**交付物（两个 aar，同版本号发布）**：
+- `echproxy.aar` —— Go 核心（现状，gomobile 编，不变）
+- `ech-android.aar` —— Kotlin 封装层 + 内嵌 Go .so（新，`mobile/ech-android` 编）
 
-### 配置下发边界（不改）
-- seed TXT / override / DoH 域名等仍由远端下发（`ech-proxy-go` 服务端 + `101.226.4.6` / `res.anglesgirl.eu.org`）
-- aar 内部拉取，接入方零配置
-- 版本号随 aar 发布，升级只需换 aar
+接入方依赖两个 aar，改动从 619 行胶水降到 ≤5 行。升级 = 换两个 aar 文件。
+
+### 解耦关键（修正原方案）
+原 4 个 kt 胶水类反向依赖 App 专属基础设施（HCookieJar / DiagnosticsLog /
+PostHogManager / Preferences），**不能直接搬进通用 aar**。解耦方式：
+- cookie：改用 Android 标准 `JavaNetCookieJar(CookieManager.getInstance())`，
+  App 自己的登录 cookie 由接入方在 `wrapOkHttp` 后自行叠加拦截器
+- 诊断/埋点：可选 `EchDiagnostics` 回调接口，不实现则空转
+- App 代理逻辑：`Ech.appProxySelector` 注入兜底，ECH 开时一律 `NO_PROXY`
+- 移除 kotlinx.coroutines 依赖，纯 `Executor` 线程，降低接入方约束
 
 ## 3. 模块边界
 
