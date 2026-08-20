@@ -9,18 +9,8 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import echproxy.Echproxy
-import okhttp3.JavaNetCookieJar
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.Interceptor
-import okhttp3.Response
-import java.io.ByteArrayInputStream
-import java.net.CookieManager as JavaCookieManager
-import java.net.HttpURLConnection
-import java.net.Proxy
-import java.net.ProxySelector
-import java.net.ServerSocket
-import java.net.URI
 import java.util.concurrent.Executors
 
 /**
@@ -28,8 +18,7 @@ import java.util.concurrent.Executors
  *
  * 设计原则（详见 ech-proxy-go/docs/ech-android-sdk-design.md）：
  *  - 本模块 **不依赖任何接入方 App 的基础设施**（cookie jar / 诊断 / 埋点 / 设置）。
- *  - cookie 统一走 Android 系统 CookieManager（标准 JavaNetCookieJar），
- *    接入方自己的登录 cookie 由接入方在 wrapOkHttp 时自行叠加拦截器。
+ *  - 模块不替换接入方的 CookieJar；登录/Cloudflare cookie 保持由宿主 App 管理。
  *  - 诊断 / 埋点通过可选回调 [EchDiagnostics] 注入，不实现则空转。
  *  - 代理选择：ECH 开启时一律 NO_PROXY（X-Ech-Target 改写模式，禁止 CONNECT 隧道）；
  *    接入方自身代理逻辑通过 [appProxySelector] 兜底。
@@ -82,13 +71,11 @@ object Ech {
     }
 
     /**
-     * 装饰 OkHttp.Builder：加入 ECH 改写拦截器 + 标准 CookieManager。
-     * 接入方应在此之后自行 add 自己的登录/cookie 拦截器（如需）。
+     * 装饰 OkHttp.Builder：只加入 ECH 改写拦截器，不触碰接入方 CookieJar。
+     * 必须放在 Cloudflare/认证等业务拦截器之后，作为最后一个应用拦截器。
      */
     fun wrapOkHttp(builder: OkHttpClient.Builder): OkHttpClient.Builder {
-        return builder
-            .cookieJar(JavaNetCookieJar(JavaCookieManager.getInstance()))
-            .addInterceptor(EchInterceptor())
+        return builder.addInterceptor(EchInterceptor())
     }
 
     /**
