@@ -29,7 +29,7 @@ else
 fi
 
 echo "[build] gradle assembleRelease"
-./gradlew :ech-android:assembleRelease
+gradle assembleRelease --no-daemon
 
 OUT=$(find . -path '*/build/outputs/aar/*.aar' | head -1)
 if [ -n "$OUT" ]; then

@@ -1,18 +1,40 @@
-// 根工程仅用于构建 ech-android library module
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
+plugins {
+    id("com.android.library")
+    kotlin("android")
+}
+
+android {
+    namespace = "com.anglesgirl.ech"
+    compileSdk = 34
+
+    defaultConfig {
+        minSdk = 24
+        consumerProguardFiles("consumer-rules.pro")
     }
-    dependencies {
-        classpath("com.android.tools.build:gradle:8.5.2")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24")
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("libs/jni")
+        }
     }
 }
 
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-    }
+dependencies {
+    implementation(files("libs/echproxy.aar"))
+    compileOnly("com.squareup.okhttp3:okhttp:4.12.0")
 }
