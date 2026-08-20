@@ -10,7 +10,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import echproxy.Echproxy
 import okhttp3.OkHttpClient
-import okhttp3.Interceptor
+import java.net.ProxySelector
 import java.util.concurrent.Executors
 
 /**

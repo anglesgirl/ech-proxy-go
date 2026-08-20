@@ -6,6 +6,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.ByteArrayInputStream
 
 /**
