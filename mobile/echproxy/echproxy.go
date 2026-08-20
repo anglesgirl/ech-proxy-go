@@ -12,11 +12,16 @@ package echproxy
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -249,14 +254,46 @@ func LastStatus() string {
 	return info
 }
 
+func sha256Hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// UploadToR2 uploads bounded diagnostic text to an S3-compatible R2 bucket.
+// The caller must provide a least-privilege key scoped to the diagnostics bucket.
+func UploadToR2(endpoint, bucket, objectKey, accessKey, secretKey, contentType, content string) bool {
+	ok := false
+	_ = safe("UploadToR2", func() error {
+		t := time.Now().UTC()
+		amzDate := t.Format("20060102T150405Z")
+		dateStamp := t.Format("20060102")
+		host := strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+		body := []byte(content)
+		hash := sha256.Sum256(body)
+		payloadHash := hex.EncodeToString(hash[:])
+		canonicalURI := "/" + bucket + "/" + objectKey
+		canonicalHeaders := fmt.Sprintf("content-type:%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n", contentType, host, payloadHash, amzDate)
+		signedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date"
+		canonicalRequest := strings.Join([]string{"PUT", canonicalURI, "", canonicalHeaders, signedHeaders, payloadHash}, "\n")
+		scope := fmt.Sprintf("%s/auto/s3/aws4_request", dateStamp)
+		stringToSign := strings.Join([]string{"AWS4-HMAC-SHA256", amzDate, scope, sha256Hex([]byte(canonicalRequest))}, "\n")
+		h := func(key, value []byte) []byte { m := hmac.New(sha256.New, key); _, _ = m.Write(value); return m.Sum(nil) }
+		kDate := h([]byte("AWS4"+secretKey), []byte(dateStamp))
+		kRegion := h(kDate, []byte("auto")); kService := h(kRegion, []byte("s3")); kSigning := h(kService, []byte("aws4_request"))
+		signature := hex.EncodeToString(h(kSigning, []byte(stringToSign)))
+		req, err := http.NewRequest(http.MethodPut, endpoint+canonicalURI, bytes.NewReader(body)); if err != nil { return err }
+		req.Header.Set("Content-Type", contentType); req.Header.Set("X-Amz-Date", amzDate); req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+		req.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", accessKey, scope, signedHeaders, signature))
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req); if err != nil { return err }; defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("R2 HTTP %d", resp.StatusCode) }
+		ok = true; return nil
+	})
+	return ok
+}
+
 // Diagnostics returns lifecycle status plus the bounded Go proxy log.
 func Diagnostics() string {
 	var info string
-	_ = safe("Diagnostics", func() error {
-		mu.Lock()
-		defer mu.Unlock()
-		info = lastInfo
-		return nil
-	})
-	return info + "\n--- go proxy log ---\n" + logs.String()
+	_ = safe("Diagnostics", func() error { mu.Lock(); defer mu.Unlock(); info = lastInfo; return nil })
+	return info + "\\n--- go proxy log ---\\n" + logs.String()
 }

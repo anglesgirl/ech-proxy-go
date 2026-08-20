@@ -129,6 +129,8 @@ internal object EchCore {
                 }
             } catch (e: Exception) {
                 lastError = e
+                Log.w(TAG, "seed DoH failed via $seed: ${e.message}", e)
+                Ech.diagnostics?.event("ECH", "seed DoH failed via $seed: ${e.message}", e)
             }
         }
         throw lastError ?: Exception("no seed DoH endpoint available")

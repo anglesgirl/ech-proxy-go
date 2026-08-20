@@ -3,12 +3,14 @@ package com.anglesgirl.ech
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import echproxy.Echproxy
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import okhttp3.OkHttpClient
 import java.net.ProxySelector
 import java.util.concurrent.Executors
@@ -48,6 +50,34 @@ object Ech {
 
     val isRunning: Boolean
         get() = port > 0 && runCatching { Echproxy.isRunning() }.getOrDefault(false)
+
+    fun diagnosticsText(): String = runCatching { Echproxy.diagnostics() }
+        .getOrElse { "ECH SDK error: ${it.message}" }
+
+    fun uploadDiagnostics(context: Context): Boolean {
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val report = buildString {
+            append("=== Mihon ECH diagnostics ===\n")
+            append("package: ").append(context.packageName).append('\n')
+            append("device: ").append(android.os.Build.MANUFACTURER).append(' ')
+                .append(android.os.Build.MODEL).append("\n")
+            append("android: ").append(android.os.Build.VERSION.SDK_INT).append('\n')
+            append("sdkRunning: ").append(isRunning).append("\n")
+            append("port: ").append(port).append("\n")
+            append(diagnosticsText().takeLast(60000))
+        }
+        return runCatching {
+            Echproxy.uploadToR2(
+                "https://cce6c3a3b595692f6041a278411fb20e.r2.cloudflarestorage.com",
+                "echdoh-certs",
+                "logs/mihon-ech/$stamp-${android.os.Process.myPid()}.txt",
+                "81b656e3afd8f3dc3a9a24a2864da3f2",
+                "922cd9103f9404f5f5361b0da9b9ffd85b32403f2c7ca9130ae4",
+                "text/plain",
+                report,
+            )
+        }.getOrDefault(false)
+    }
 
     /**
      * 应用启动时调用一次（替代原 EchProxyManager.startAsync）。
