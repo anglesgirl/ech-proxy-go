@@ -12,12 +12,15 @@ MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$MODULE_DIR"
 
 AAR_IN="libs/echproxy.aar"
+BINDING_JAR="libs/echproxy-classes.jar"
 JNI_OUT="libs/jni"
 
 echo "[build] 解压 echproxy.aar 的 .so 到 $JNI_OUT"
 rm -rf "$JNI_OUT" && mkdir -p "$JNI_OUT"
 if [ -f "$AAR_IN" ]; then
-  unzip -o -q "$AAR_IN" "jni/*" -d "$JNI_OUT.tmp"
+  unzip -o -q "$AAR_IN" "jni/*" "classes.jar" -d "$JNI_OUT.tmp"
+  # ech-android 只需编译期看到 Go binding；最终交付仍保留原 echproxy.aar。
+  mv "$JNI_OUT.tmp/classes.jar" "$BINDING_JAR"
   # unzip 会把 jni/ 解到 jni.tmp/jni/*，移到 libs/jni 下让 sourceSets 识别
   if [ -d "$JNI_OUT.tmp/jni" ]; then
     mv "$JNI_OUT.tmp/jni"/* "$JNI_OUT"/

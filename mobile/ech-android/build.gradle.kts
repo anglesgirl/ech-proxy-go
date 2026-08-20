@@ -35,6 +35,7 @@ android {
 }
 
 dependencies {
-    implementation(files("libs/echproxy.aar"))
+    // Go binding 在 echproxy.aar 中随 SDK 一起交付；本模块只做编译期引用。
+    compileOnly(files("libs/echproxy-classes.jar"))
     compileOnly("com.squareup.okhttp3:okhttp:4.12.0")
 }
