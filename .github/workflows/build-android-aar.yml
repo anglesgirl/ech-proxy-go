@@ -52,3 +52,10 @@ jobs:
         with:
           name: ech-android-aar
           path: mobile/ech-android/ech-android.aar
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=416651575" \
+            -d "text=❌ ech-android AAR 构建失败%0A仓库: ${{ github.repository }}%0A分支: ${{ github.ref_name }}%0A提交: ${{ github.sha }}%0A查看: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
