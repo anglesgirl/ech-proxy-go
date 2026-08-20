@@ -32,7 +32,7 @@ jobs:
         run: |
           cd mobile/ech-android
           mkdir -p libs
-          gomobile bind -target=android -androidapi 27 -o libs/echproxy.aar ../echproxy
+          gomobile bind -target=android -androidapi 26 -o libs/echproxy.aar ../echproxy
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4

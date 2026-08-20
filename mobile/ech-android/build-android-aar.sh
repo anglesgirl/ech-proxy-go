@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 构建 ech-android.aar（Kotlin 封装层 + Go 核心 .so 合并为单一 aar）
+# 构建 ech-android.aar（Kotlin 封装层；与 echproxy.aar 成对交付）
 #
 # 前置：
-#   1) 已用 gomobile 编出 echproxy.aar（CI build-aar.yml 产物）放在 ./libs/echproxy.aar
+#   1) 已用 gomobile 编出 Android API 26 的 echproxy.aar（CI build-aar.yml 产物）放在 ./libs/echproxy.aar
 #   2) 本机有 Android SDK + Gradle
 #
-# 产出：ech-android.aar（含 Kotlin 封装 + jniLibs/*.so + echproxy Java 绑定类）
+# 产出：ech-android.aar（Kotlin 封装，需与 echproxy.aar 一起引用）
 set -euo pipefail
 
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
