@@ -59,6 +59,13 @@ var (
 	lastInfo    = "not started"
 	logs        = &boundedLog{}
 	mitmEnabled bool
+	// Diagnostic uploads must never inherit an app or ECH loopback proxy.
+	directHTTPClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+		},
+	}
 )
 
 // safe runs fn and converts any panic into a recorded status + error, so a
@@ -260,6 +267,7 @@ func sha256Hex(b []byte) string {
 }
 
 // UploadToR2 uploads bounded diagnostic text to an S3-compatible R2 bucket.
+// It always uses a direct transport so reporting still works when ECH is down.
 // The caller must provide a least-privilege key scoped to the diagnostics bucket.
 func UploadToR2(endpoint, bucket, objectKey, accessKey, secretKey, contentType, content string) bool {
 	ok := false
@@ -277,16 +285,34 @@ func UploadToR2(endpoint, bucket, objectKey, accessKey, secretKey, contentType, 
 		canonicalRequest := strings.Join([]string{"PUT", canonicalURI, "", canonicalHeaders, signedHeaders, payloadHash}, "\n")
 		scope := fmt.Sprintf("%s/auto/s3/aws4_request", dateStamp)
 		stringToSign := strings.Join([]string{"AWS4-HMAC-SHA256", amzDate, scope, sha256Hex([]byte(canonicalRequest))}, "\n")
-		h := func(key, value []byte) []byte { m := hmac.New(sha256.New, key); _, _ = m.Write(value); return m.Sum(nil) }
+		h := func(key, value []byte) []byte {
+			m := hmac.New(sha256.New, key)
+			_, _ = m.Write(value)
+			return m.Sum(nil)
+		}
 		kDate := h([]byte("AWS4"+secretKey), []byte(dateStamp))
-		kRegion := h(kDate, []byte("auto")); kService := h(kRegion, []byte("s3")); kSigning := h(kService, []byte("aws4_request"))
+		kRegion := h(kDate, []byte("auto"))
+		kService := h(kRegion, []byte("s3"))
+		kSigning := h(kService, []byte("aws4_request"))
 		signature := hex.EncodeToString(h(kSigning, []byte(stringToSign)))
-		req, err := http.NewRequest(http.MethodPut, endpoint+canonicalURI, bytes.NewReader(body)); if err != nil { return err }
-		req.Header.Set("Content-Type", contentType); req.Header.Set("X-Amz-Date", amzDate); req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+		req, err := http.NewRequest(http.MethodPut, endpoint+canonicalURI, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("X-Amz-Date", amzDate)
+		req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 		req.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", accessKey, scope, signedHeaders, signature))
-		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req); if err != nil { return err }; defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("R2 HTTP %d", resp.StatusCode) }
-		ok = true; return nil
+		resp, err := directHTTPClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("R2 HTTP %d", resp.StatusCode)
+		}
+		ok = true
+		return nil
 	})
 	return ok
 }
