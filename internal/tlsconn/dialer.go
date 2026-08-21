@@ -119,20 +119,10 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 		return nil, fmt.Errorf("no IP for %s", hostname)
 	}
 
-	// Build candidate address list: custom IPs (operator-verified edge,
-	// e.g. DoH endpoint IPs known to be reachable) first, then DoH-resolved
-	// IPs. Custom-first matters on restricted networks: DoH-resolved edge
-	// IPs of the target may be blocked (GFW), while the DoH endpoint's own
-	// AS13335 IP is by definition reachable — trying it first avoids
-	// multi-second timeouts on blocked candidates.
-	port := "443"
-	var candidates []string
-	for _, ip := range d.customIPs {
-		candidates = append(candidates, net.JoinHostPort(ip, port))
-	}
-	for _, ip := range result.IPs {
-		candidates = append(candidates, net.JoinHostPort(ip.String(), port))
-	}
+	// ECH-specific preferred IPs are only valid for Cloudflare ECH edges.
+	// Plain-TLS hosts (for example api.github.com) must use their own DoH
+	// result; sending their SNI to a Cloudflare edge causes a TLS failure.
+	candidates := d.candidateAddresses(result)
 
 	tlsConfig := &utls.Config{
 		ServerName:         hostname,
@@ -221,6 +211,20 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 	}
 	return nil, fmt.Errorf("TLS handshake failed for %s after %d candidate(s): %w",
 		hostname, len(candidates), lastErr)
+}
+
+func (d *Dialer) candidateAddresses(result *dns.Result) []string {
+	port := "443"
+	candidates := make([]string, 0, len(result.IPs)+len(d.customIPs))
+	if result.ECH != nil && len(result.ECH.Config) > 0 {
+		for _, ip := range d.customIPs {
+			candidates = append(candidates, net.JoinHostPort(ip, port))
+		}
+	}
+	for _, ip := range result.IPs {
+		candidates = append(candidates, net.JoinHostPort(ip.String(), port))
+	}
+	return candidates
 }
 
 func (d *Dialer) dialTLS(addr string, cfg *utls.Config, hostname string) (net.Conn, error) {
