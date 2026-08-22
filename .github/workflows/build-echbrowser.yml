@@ -54,6 +54,14 @@ jobs:
           cd android-echbrowser
           gradle assembleDebug --no-daemon
 
+      - name: Upload DoH AAR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: echdoh-aar-${{ github.sha }}
+          path: android-echbrowser/app/libs/echdoh.aar
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         with:
           name: echbrowser-apk
