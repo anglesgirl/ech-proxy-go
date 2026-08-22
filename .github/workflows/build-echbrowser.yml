@@ -31,7 +31,7 @@ jobs:
       - name: Build Go DoH AAR
         run: |
           mkdir -p android-echbrowser/app/libs
-          gomobile bind -javapkg com.anglesgirl.echbrowser -target=android -androidapi 27 -o android-echbrowser/app/libs/echdoh.aar ./mobile/echdoh
+          gomobile bind -javapkg com.anglesgirl.echbrowser -target=android -androidapi 26 -o android-echbrowser/app/libs/echdoh.aar ./mobile/echdoh
 
       - name: Inject DoH cert from secrets
         run: |
