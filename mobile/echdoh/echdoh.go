@@ -13,12 +13,19 @@ package echdoh
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"math/rand"
 	"net"
 	"net/http"
@@ -191,9 +198,15 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 		return nil
 	}
 	if strings.TrimSpace(listen) == "" {
-		// 2026-08-17：改 0.0.0.0 让浏览器进程也能连（Android 每 app 独立网络命名空间，
-	// 127.0.0.1 只能同进程访问；0.0.0.0 允许同设备不同进程访问 127.0.0.1:8443）
-	listen = "0.0.0.0:8443"
+		listen = "127.0.0.1:18443"
+	}
+	if strings.TrimSpace(certPEM) == "" || strings.TrimSpace(keyPEM) == "" {
+		var err error
+		certPEM, keyPEM, err = generateLocalCertificate()
+		if err != nil {
+			lastErr = "generate local cert: " + err.Error()
+			return err
+		}
 	}
 	upstream = nil
 	// 2026-08-16：种子 TXT（ech-config.anglesgirl.eu.org doh=/doh2=/doh3=）
@@ -284,6 +297,40 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 		}
 	}()
 	return nil
+}
+
+// generateLocalCertificate keeps the private key in memory only. The certificate
+// is scoped to the loopback endpoints used by the embedded DoH.
+func generateLocalCertificate() (string, string, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	serial, err := crand.Int(crand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return "", "", err
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.AddDate(1000, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(crand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return "", "", err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return "", "", err
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})), nil
 }
 
 // Stop 关闭服务器。安全可重复调用。
