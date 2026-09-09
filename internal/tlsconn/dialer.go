@@ -33,15 +33,6 @@ type Dialer struct {
 	fallbackPlain bool // ECH failed → plain TLS (set false for protected hosts)
 	customIPs     []string
 	certPool      *utls.Config
-	// onRetryConfig, when set, persists a server-provided retry_configs to the
-	// disk cache so the next connection handshakes straight from cache.
-	onRetryConfig func(host string, config []byte)
-}
-
-// SetRetryConfigSink registers a callback that receives server-provided
-// retry_configs after a successful ECH rejection retry, so they can be cached.
-func (d *Dialer) SetRetryConfigSink(fn func(host string, config []byte)) {
-	d.onRetryConfig = fn
 }
 
 // New creates an ECH dialer.
@@ -173,10 +164,6 @@ func (d *Dialer) DialECH(hostname string, result *dns.Result) (net.Conn, error) 
 			if retryErr == nil {
 				if tlsConn, ok := conn.(*utls.UConn); ok && tlsConn.ConnectionState().ECHAccepted {
 					log.Printf("[tls] ECH accepted via %s (retry_configs)", addr)
-				}
-				// 缓存 server retry_configs,下次直接用它握手。
-				if d.onRetryConfig != nil {
-					d.onRetryConfig(hostname, rej.RetryConfigList)
 				}
 				return conn, nil
 			}

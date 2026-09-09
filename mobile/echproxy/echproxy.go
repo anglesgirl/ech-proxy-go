@@ -12,20 +12,14 @@ package echproxy
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/anglesgirl/ech-proxy-go/internal/cloudflare"
 	"github.com/anglesgirl/ech-proxy-go/internal/config"
 	"github.com/anglesgirl/ech-proxy-go/internal/proxy"
 )
@@ -58,14 +52,6 @@ var (
 	server      *proxy.Server
 	lastInfo    = "not started"
 	logs        = &boundedLog{}
-	mitmEnabled bool
-	// Diagnostic uploads must never inherit an app or ECH loopback proxy.
-	directHTTPClient = &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			Proxy: nil,
-		},
-	}
 )
 
 // safe runs fn and converts any panic into a recorded status + error, so a
@@ -82,37 +68,6 @@ func safe(what string, fn func() error) (err error) {
 		}
 	}()
 	return fn()
-}
-
-// SetMitm 在 Start 前调用，启用/禁用 CONNECT MITM 模式。
-// MITM 让不改协议的客户端（libmpv/WebView/系统播放器）也能获得完整 ECH：
-// 代理下游用自签证书终止客户端 TLS，上游用 ECH 直连。
-// 客户端需信任代理 CA 或跳过证书校验（如 mpv tls-verify=no）。
-func SetMitm(enabled bool) {
-	mu.Lock()
-	defer mu.Unlock()
-	mitmEnabled = enabled
-}
-
-// GetMitm 返回当前 MITM 模式开关状态
-func GetMitm() bool {
-	mu.Lock()
-	defer mu.Unlock()
-	return mitmEnabled
-}
-
-// GetCAPem 返回 MITM CA 证书（PEM 格式），供 Android 写入文件/安装信任
-func GetCAPem() string {
-	var pem string
-	_ = safe("GetCAPem", func() error {
-		mu.Lock()
-		defer mu.Unlock()
-		if server != nil {
-			pem = string(server.GetMitmCAPem())
-		}
-		return nil
-	})
-	return pem
 }
 
 // Start launches a loopback-only HTTP CONNECT proxy.
@@ -137,7 +92,6 @@ func Start(listen, doh, cachePath string, noDowngrade bool) error {
 		cfg.Mode = "http"
 		cfg.DNS.CachePath = cachePath
 		cfg.ECH.NoDowngrade = noDowngrade
-		cfg.MITM.Enabled = mitmEnabled
 		if err := cfg.Validate(); err != nil {
 			return err
 		}
@@ -170,18 +124,6 @@ func Start(listen, doh, cachePath string, noDowngrade bool) error {
 			}
 		}()
 		lastInfo = "listening on " + listen
-		// 2026-08-15 CF IP 三阶段优选（用户方案，与 CO3 同源）：
-		// 有缓存(12h)立即返回；无缓存 → 采样50不同网段 + TCP延迟排序2s
-		// top10 → speed.cloudflare.com 下载测速8s top3 → 写缓存。
-		// 同步执行：启动即绑定最快 IP 不再乱跳，总耗时 ≤10s。
-		fastStart := time.Now()
-		fastIPs := cloudflare.OptimizeFastIPs(cfg.DNS.CachePath)
-		if len(fastIPs) > 0 {
-			s.SetPreferredIPs(fastIPs)
-			log.Printf("[echproxy] preferred IP scan done in %v: %v", time.Since(fastStart), fastIPs)
-		} else {
-			log.Printf("[echproxy] preferred IP scan: none (took %v)", time.Since(fastStart))
-		}
 		return nil
 	})
 }
@@ -259,62 +201,6 @@ func LastStatus() string {
 		return nil
 	})
 	return info
-}
-
-func sha256Hex(b []byte) string {
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
-}
-
-// UploadToR2 uploads bounded diagnostic text to an S3-compatible R2 bucket.
-// It always uses a direct transport so reporting still works when ECH is down.
-// The caller must provide a least-privilege key scoped to the diagnostics bucket.
-func UploadToR2(endpoint, bucket, objectKey, accessKey, secretKey, contentType, content string) bool {
-	ok := false
-	_ = safe("UploadToR2", func() error {
-		t := time.Now().UTC()
-		amzDate := t.Format("20060102T150405Z")
-		dateStamp := t.Format("20060102")
-		host := strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
-		body := []byte(content)
-		hash := sha256.Sum256(body)
-		payloadHash := hex.EncodeToString(hash[:])
-		canonicalURI := "/" + bucket + "/" + objectKey
-		canonicalHeaders := fmt.Sprintf("content-type:%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n", contentType, host, payloadHash, amzDate)
-		signedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date"
-		canonicalRequest := strings.Join([]string{"PUT", canonicalURI, "", canonicalHeaders, signedHeaders, payloadHash}, "\n")
-		scope := fmt.Sprintf("%s/auto/s3/aws4_request", dateStamp)
-		stringToSign := strings.Join([]string{"AWS4-HMAC-SHA256", amzDate, scope, sha256Hex([]byte(canonicalRequest))}, "\n")
-		h := func(key, value []byte) []byte {
-			m := hmac.New(sha256.New, key)
-			_, _ = m.Write(value)
-			return m.Sum(nil)
-		}
-		kDate := h([]byte("AWS4"+secretKey), []byte(dateStamp))
-		kRegion := h(kDate, []byte("auto"))
-		kService := h(kRegion, []byte("s3"))
-		kSigning := h(kService, []byte("aws4_request"))
-		signature := hex.EncodeToString(h(kSigning, []byte(stringToSign)))
-		req, err := http.NewRequest(http.MethodPut, endpoint+canonicalURI, bytes.NewReader(body))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", contentType)
-		req.Header.Set("X-Amz-Date", amzDate)
-		req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-		req.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", accessKey, scope, signedHeaders, signature))
-		resp, err := directHTTPClient.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("R2 HTTP %d", resp.StatusCode)
-		}
-		ok = true
-		return nil
-	})
-	return ok
 }
 
 // Diagnostics returns lifecycle status plus the bounded Go proxy log.

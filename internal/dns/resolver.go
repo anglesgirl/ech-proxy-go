@@ -3,8 +3,7 @@
 // Improvements ported from production ECH proxy:
 //   - Multi-endpoint DoH: comma-separated URLs, tries each until one succeeds
 //   - Wire-format SVCB parsing (RFC 3597) in addition to textual ech= output
-//   - File-based ECH config cache with 12h TTL for faster cold starts
-//   - Stale cache fallback: serve expired entries when DoH is unreachable
+//   - In-memory DNS cache with TTL; ECH configs always fetched live (no disk cache)
 package dns
 
 import (
@@ -20,8 +19,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -477,76 +474,6 @@ func parseSVCBWire(data string) ([]byte, string, error) {
 
 // ECH 公钥配置缓存 5 小时:公钥轮换频率远低于此,期间连接直接用缓存握手,
 // 避免每次启动/换 host 都实时查 DoH。兜底配置(server retry_configs /
-// cloudflare-ech.com / 目标自身 ech=)同样缓存,失败后降级普通 TLS。
-const publicECHCacheTTL = 5 * time.Hour
-
-type publicECHCache struct {
-	Host      string `json:"host"`
-	ConfigB64 string `json:"config_b64"`
-	ExpiresAt int64  `json:"expires_at"`
-}
-
-func LoadECHCacheFile(path, host string) []byte {
-	if strings.TrimSpace(path) == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var record publicECHCache
-	if json.Unmarshal(data, &record) != nil {
-		return nil
-	}
-	if !strings.EqualFold(record.Host, host) {
-		return nil
-	}
-	if record.ExpiresAt <= time.Now().Unix() {
-		return nil
-	}
-	b, err := base64.StdEncoding.DecodeString(record.ConfigB64)
-	if err != nil || len(b) == 0 {
-		return nil
-	}
-	return b
-}
-
-func StoreECHCacheFile(path, host string, config []byte) {
-	if strings.TrimSpace(path) == "" || len(config) == 0 {
-		return
-	}
-	record, err := json.Marshal(publicECHCache{
-		Host:      strings.ToLower(host),
-		ConfigB64: base64.StdEncoding.EncodeToString(config),
-		ExpiresAt: time.Now().Add(publicECHCacheTTL).Unix(),
-	})
-	if err != nil {
-		return
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return
-	}
-	tmp, err := os.CreateTemp(dir, ".echconfig-")
-	if err != nil {
-		return
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if _, err := tmp.Write(record); err != nil {
-		tmp.Close()
-		return
-	}
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		return
-	}
-	_ = os.Rename(name, path)
-}
-
 // cloudflareECHHost 是 Cloudflare 官方的 ECH 公钥发布点。它的 HTTPS 记录里
 // 带 ech= 参数,代表 Cloudflare 边缘的当前 ECH 公钥,适用于所有 Cloudflare
 // 托管的 AS13335 目标(archiveofourown.org 即其中之一)。
@@ -561,50 +488,30 @@ const cloudflareECHHost = "cloudflare-ech.com"
 // 2026-08-13 抓取自 cloudflare-ech.com HTTPS 记录。
 const builtinCFECHConfigB64 = "AEX+DQBBNAAgACCyup0GYiVj1Iph45mjgzNuuKu0qMra6LGPbZVfMTXgJwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA="
 
-// CacheECHConfig persists an ECHConfigList for a host to the disk cache.
-// Exported so the dialer can cache server-provided retry_configs too.
-func (r *Resolver) CacheECHConfig(host string, config []byte) {
-	if r.cachePath != "" && len(config) > 0 {
-		StoreECHCacheFile(r.cachePath, host, config)
-	}
-}
-
 // FetchECHConfig returns the ECHConfigList for an AS13335 host, trying in order:
-//  1. the local 5h disk cache (learned from a previous fetch or retry_configs)
-//  2. cloudflare-ech.com's HTTPS ech= (Cloudflare's official ECH public key)
-//  3. the target's own HTTPS ech= record
+//  1. cloudflare-ech.com's HTTPS ech= (Cloudflare's official ECH public key)
+//  2. the target's own HTTPS ech= record
+//  3. the built-in Cloudflare public key snapshot (last resort, offline-safe).
 //
-// The first successful source is persisted to the cache so subsequent
-// connections handshake straight from cache without another DoH round-trip.
+// No disk cache: ECH configs are always fetched live over DoH (online-DoH design).
 func (r *Resolver) FetchECHConfig(host string) ([]byte, string, error) {
-	// 1. Cache first:握手用缓存配置,不发 DoH。
-	if r.cachePath != "" {
-		if cached := LoadECHCacheFile(r.cachePath, host); cached != nil {
-			log.Printf("[dns] using file-cached ECH config for %s", host)
-			return cached, "", nil
-		}
-	}
-
-	// 2. Cloudflare 官方 ECH 公钥(适用所有 CF 站点)。
+	// 1. Cloudflare 官方 ECH 公钥(适用所有 CF 站点)。
 	if ech, outer, err := r.queryHTTPS(cloudflareECHHost); err == nil && ech != nil {
-		r.CacheECHConfig(host, ech.Config)
 		log.Printf("[dns] ECH config for %s from %s (outer=%s)", host, cloudflareECHHost, outer)
 		return ech.Config, outer, nil
 	}
 
-	// 3. 目标自身 HTTPS 记录的 ech=。
+	// 2. 目标自身 HTTPS 记录的 ech=。
 	if ech, outerName, err := r.queryHTTPS(host); err == nil && ech != nil {
-		r.CacheECHConfig(host, ech.Config)
 		log.Printf("[dns] ECH config for %s from target HTTPS ech=", host)
 		return ech.Config, outerName, nil
 	}
 
-	// 4. 内置 Cloudflare 公共公钥(最后兜底)。
+	// 3. 内置 Cloudflare 公共公钥(最后兜底)。
 	// 部分区域封禁 cloudflare-ech.com 的 IP / 干扰 DoH,导致上面 1-3 全失败。
 	// 内置快照保证 AS13335 主机仍能发起 ECH 握手;公钥轮换由服务器
 	// retry_configs 兜底(握手被拒时自动更新),无需网络拉取也能自愈。
 	if b, err := base64.StdEncoding.DecodeString(builtinCFECHConfigB64); err == nil && len(b) > 0 {
-		r.CacheECHConfig(host, b)
 		log.Printf("[dns] ECH config for %s from built-in Cloudflare public key (fallback)", host)
 		return b, cloudflareECHHost, nil
 	}

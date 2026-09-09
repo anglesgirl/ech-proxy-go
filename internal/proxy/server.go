@@ -32,8 +32,6 @@ type Server struct {
 	// HTTP 请求 + X-Ech-Target 头,代理用 ECH 连上游、返回明文响应。
 	// 与 CONNECT 隧道不同:客户端不需要自己再 TLS 握手。
 	appLayerClient *http.Client
-	// mitm 非空时启用 CONNECT MITM 模式（下游自签 TLS + 上游 ECH）
-	mitm *mitmCA
 }
 
 // builtinDoHHostIPs 是 Cloudflare Gateway DoH 端点域名当前解析的 IP 快照
@@ -138,27 +136,11 @@ func New(cfg *config.Config) *Server {
 	// 胜出 → 目标站返回 CF 1034(Edge IP Restricted)；同一官方 IP 串行
 	// 使用(如 Han1meViewer)稳定 200。结论：只连目标域官方段, 不连
 	// Gateway 段。CO3 副本已同步移除。
-	// ECH 握手被拒且服务器给了 retry_configs 时,缓存到磁盘供下次直接使用。
-	dialer.SetRetryConfigSink(func(host string, config []byte) {
-		resolver.CacheECHConfig(host, config)
-		log.Printf("[proxy] cached server retry_configs for %s (%d bytes)", host, len(config))
-	})
 
 	srv := &Server{
 		cfg:      cfg,
 		resolver: resolver,
 		dialer:   dialer,
-	}
-
-	// MITM 模式：初始化动态 CA（客户端需信任该 CA 或跳过校验）
-	if cfg.MITM.Enabled {
-		ca, err := newMitmCA()
-		if err != nil {
-			log.Printf("[proxy] MITM CA init failed: %v", err)
-		} else {
-			srv.mitm = ca
-			log.Printf("[proxy] MITM mode enabled (client must trust proxy CA or skip verify)")
-		}
 	}
 
 	// 应用层转发:用 DialerWithCache 作为 DialTLSContext,
@@ -241,29 +223,10 @@ func (s *Server) SetEndpoints(doh, ip string) {
 	}
 }
 
-// SetPreferredIPs 将测速优选的 IP 前置到候选最前（不丢现有 custom IPs：
-// 远程配置 IP / DoH 端点 IP 保留在优选 IP 之后）。移动宽带下优选 IP
-// 是实测最快的边缘，优先尝试可避免串行试不可达 IP 白等。
-func (s *Server) SetPreferredIPs(ips []string) {
-	if len(ips) == 0 {
-		return
-	}
-	s.dialer.PrependCustomIPs(ips)
-	log.Printf("[proxy] preferred IPs prepended: %v", ips)
-}
-
-// SetOverrides hot-updates per-host fixed IP lists (seed TXT `override=`)
+// SetOverrides hot-updates per-host fixed IP lists (seed TXT `override=`
 // field). Hosts listed bypass DoH A/AAAA and dial with plain TLS only.
 func (s *Server) SetOverrides(spec string) {
 	s.resolver.SetOverrides(spec)
-}
-
-// GetMitmCAPem 返回 MITM CA 证书（PEM 格式），供外部导出/安装信任
-func (s *Server) GetMitmCAPem() []byte {
-	if s.mitm != nil {
-		return s.mitm.caPEM()
-	}
-	return nil
 }
 
 // handleHTTP handles HTTP requests: application-layer forwarding
@@ -286,10 +249,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[http] CONNECT %s:%s", host, port)
 
-	// CONNECT 隧道语义:;
-	// 模式A（默认）: 纯 TCP 转发，客户端自己 TLS 握手（SNI 明文），代理只做 DoH 去污染。
-	// 模式B（MITM，需 cfg.MITM 启用）: 代理终止客户端 TLS（自签证书）再以 ECH/普通 TLS
-	//   连上游——客户端只需信任代理 CA（或跳过校验），任何不改协议的 App 都能获得 ECH。
+	// CONNECT 隧道语义:纯 TCP 转发，客户端自己 TLS 握手，代理只做 DoH 去污染。
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
@@ -303,12 +263,6 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer clientConn.Close()
-
-	// MITM 模式：接管 TLS，客户端无需改协议（libmpv/系统播放器/WebView 全兼容）
-	if s.mitm != nil {
-		s.handleConnectMitm(clientConn, host, port)
-		return
-	}
 
 	// DoH 解析目标（带缓存/override），失败回退系统 DNS
 	targetAddr := net.JoinHostPort(host, port)

@@ -10,6 +10,10 @@
 
 本仓库是 **ECN（Encrypted Client Hello）TCP/HTTP 代理** 的实现：DNS(DoH) 解析、ECH 握手、TLS 降级、缓存、CONNECT 隧道、应用层转发。Android App（Han1meViewer-ECH）通过 gomobile 生成的 AAR 调用它。
 
+> 2026-09-09 slim-core 精简：MITM、R2 上传、CF IP 优选、ECH 磁盘缓存已移除（转线上 DoH）。
+> 代理只做 ECH 传输层：DoH 解析（内存缓存）、ECH 握手（含被拒内存重试）、TLS 降级、
+> CONNECT 纯 TCP 隧道、应用层 X-Ech-Target 转发。AS13335 判定保留（ECH/明文路由依据）。
+
 ---
 
 ## 1. 必须遵循的约束
