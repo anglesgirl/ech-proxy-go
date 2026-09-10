@@ -118,7 +118,11 @@ Android 集成还必须验证：冷启动不等待远程配置、主 OkHttp/图�
 ```text
 ech-proxy-go/
 ├── AGENTS.md                    # AI 和贡献者不可违反的集成规则
-├── cmd/ech-proxy/               # CLI 入口
+├── cmd/
+│   ├── ech-proxy/               # 通用 ECH 代理（HTTP CONNECT + SOCKS5）
+│   ├── ech-doh/                 # 本地 DoH 注入服务器（桌面/CLI 版）
+│   ├── dohbench/                # DoH 应答延迟测量（排障入口，见 AGENTS.md 1.9）
+│   └── admincheck/              # 起 echdoh 并验证 /admin 路由
 ├── internal/
 │   ├── certutil/                # 跨平台证书加载
 │   ├── cloudflare/              # AS13335 IP 校验
@@ -126,12 +130,21 @@ ech-proxy-go/
 │   ├── dns/                     # DoH、SVCB/TXT、缓存
 │   ├── proxy/                   # HTTP CONNECT + SOCKS5 + relay
 │   └── tlsconn/                 # ECH TLS、retry_configs、降级
-├── android-ui/                  # Compose 设置组件（可选）
+├── mobile/
+│   ├── echproxy/                # ECH 代理核心（gomobile bind → CO3 用 AAR）
+│   └── echdoh/                  # 本地 DoH 服务器（gomobile 与 CLI 共用同一实现）
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   └── ANDROID_INTEGRATION.md
-└── .github/workflows/           # 多平台构建与 Release
+│   ├── ANDROID_INTEGRATION.md
+│   └── GOMOBILE_API.md
+└── .github/workflows/
+    ├── build.yml                # 多平台 CLI 构建与 Release
+    └── build-aar.yml            # mobile/echproxy → echproxy-latest Release（CO3 消费）
 ```
+
+> 2026-09-10 清理：移除 echbrowser / xprobe / android-ui / Mihon ECH SDK 四条未完成的
+> 支线（含对应 `cmd/` 工具、Gradle 工程与 CI 工作流），并删掉误提交的编译产物。
+> 需要时从 git 历史重新拉取，不保留半成品。
 
 ## 许可证
 

@@ -137,7 +137,8 @@ go run ./cmd/dohbench -budget 3000               # Firefox trr.request-timeout �
 - `ERR unpack: ... overflow unpacking uint16` = **响应体空**（见 1.8）
 - `TIMEOUT` = 超过 Firefox 预算，`trr.mode=3` 无回退 → loadError
 - `EMPTY` = A 记录 0 条，Firefox 立即 loadError
-- `OK` + 答案内容 = 正常，此时问题在 TLS/ECH 连接层，才该去看 xprobe
+- `OK` + 答案内容 = 正常，此时问题在 TLS/ECH 连接层（需真机或用 ECH 探测工具验证；
+  原先仓内的 xprobe 系列工具已于 2026-09-10 清理移除，要复现需从 git 历史取回）
 
 **坑**：解析 HTTPS 记录时，`Unpack` 后的类型是 `*dns.HTTPS`（内嵌 SVCB），
 不是 `*dns.SVCB`。只判断后者会把所有真实响应漏掉、误报 `(no svcb)`。
@@ -184,3 +185,25 @@ export PATH=/tmp/go-toolchain/go/bin:$PATH   # 本机 go 工具链路径
 gofmt -w <file> && go build ./... && go vet ./... && go test ./...
 # CI 用 actions/checkout + setup-go + gomobile bind 编 AAR
 ```
+
+---
+
+## 5. 已移除的部分（2026-09-10 清理）
+
+以下都是**未完成的半成品**，已整体删除（工程 + 对应 CI + 工具），不再维护。
+如需复现请从 git 历史取回，**不要在主干上继续开发**：
+
+| 已移除 | 原来是什么 |
+|---|---|
+| `android-echbrowser/` + `build-echbrowser.yml` | Firefox 系 ECH 测试浏览器 |
+| `android-xprobe/` + `cmd/xprobe`、`cmd/xprobe-force` + `build-xprobe-apk.yml` | x.com / i.pximg.net 的 ECH 探测与测试浏览器 |
+| `android-ui/` + 根 `settings.gradle.kts` + `README_ANDROID_UI.md` | Compose 设置组件 |
+| `mobile/ech-android/` + `build-android-aar.yml` | Mihon（Han1meViewer）用 ECH SDK 的 Kotlin 包装 |
+| `cmd/probe/`、`set-proxy.ps1`、`unset-proxy.ps1`、`start.bat` | 一次性调试脚本 / Windows 辅助脚本 |
+| 仓根 `dohbench`（ELF 可执行文件） | 误提交的编译产物（与 `cmd/dohbench` 源码易混） |
+
+**保留的主干**：`mobile/echproxy`（CO3 消费 AAR）、`mobile/echdoh`（CLI 与 gomobile 共用）、
+`cmd/{ech-proxy,ech-doh,dohbench,admincheck}`、`internal/*`、`build.yml`、`build-aar.yml`。
+
+**注意**：本文档 1.8 / 1.9 里提到的 echbrowser、xprobe 是**当时排障的历史证据**，
+工具本身已删——看到这些名字不要去找文件。
