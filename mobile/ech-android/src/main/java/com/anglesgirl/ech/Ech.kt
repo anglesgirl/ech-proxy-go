@@ -54,10 +54,17 @@ object Ech {
     fun diagnosticsText(): String = runCatching { Echproxy.diagnostics() }
         .getOrElse { "ECH SDK error: ${it.message}" }
 
+    /**
+     * 把诊断信息写到 app 私有目录（本地落盘，不再走远端上传）。
+     *
+     * 原实现调用 Echproxy.uploadToR2 —— 但 slim-core 精简后 echproxy 包
+     * 已不再导出 UploadToR2（该函数只存在于 echdoh 包），导致 Kotlin 编译
+     * 报 Unresolved reference；方法体内还硬编码了历史 R2 凭证，一并清除。
+     */
     fun uploadDiagnostics(context: Context): Boolean {
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val report = buildString {
-            append("=== Mihon ECH diagnostics ===\n")
+            append("=== ECH diagnostics ===\n")
             append("package: ").append(context.packageName).append('\n')
             append("device: ").append(android.os.Build.MANUFACTURER).append(' ')
                 .append(android.os.Build.MODEL).append("\n")
@@ -67,15 +74,10 @@ object Ech {
             append(diagnosticsText().takeLast(60000))
         }
         return runCatching {
-            Echproxy.uploadToR2(
-                "https://cce6c3a3b595692f6041a278411fb20e.r2.cloudflarestorage.com",
-                "echdoh-certs",
-                "logs/mihon-ech/$stamp-${android.os.Process.myPid()}.txt",
-                "81b656e3afd8f3dc3a9a24a2864da3f2",
-                "922cd9103f9404f5f5361b0da9b9ffd85b32403f2c7ca9130ae4",
-                "text/plain",
-                report,
-            )
+            context.openFileOutput("ech-diag-$stamp.txt", Context.MODE_PRIVATE).use { out ->
+                out.write(report.toByteArray())
+            }
+            true
         }.getOrDefault(false)
     }
 
